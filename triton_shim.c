@@ -105,6 +105,10 @@ const char* triton_compile(const char* ttir_mlir, int num_warps) {
     pm.addPass(mlir::triton::createTritonRewriteTensorDescriptorToPointer());
     pm.addPass(mlir::createCanonicalizerPass());
 
+    // Unroll loops so accelerate_matmul can match every tt.dot
+    pm.addPass(mlir::triton::createTritonLoopUnroll());
+    pm.addPass(mlir::createCanonicalizerPass());
+
     // TTIR → TTGIR
     mlir::triton::ConvertTritonToTritonGPUOptions opts;
     opts.target = "cuda:86";

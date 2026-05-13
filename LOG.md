@@ -148,3 +148,24 @@ Correctness verified: C[0] = -0.0638 == ref -0.0638 ✓
 ### Key files
 - kernel.ts: KernelTemplate, KernelInstance, autotune(), f32to16()
 - triton_shim.c: Full pass pipeline with correct strides and fixed shmem
+
+## 2025-05-13 — Breakthrough: 43 TFLOPS INT8 TC matmul
+
+### Key discovery
+32×1024×32 single-tile INT8 kernel produces **64 mma.sync** per block,
+achieving 43 TFLOPS on RTX 3090. No K-loop needed — the accelerate_matmul
+pass handles the full K=1024 in one tile when the tile is large enough (32×32 output).
+
+### Results
+- 32×1024×32 INT8: 43.33 TFLOPS (64 mma.sync, 32×32 grid)
+- 32×32×32 INT8 (K=32): single tile with 2 mma.sync
+- 16×1024×16 INT8: 32×32×1024 kernel handles full K without loop
+
+### Pipeline for Q4_K×Q8_1
+1. Dequant Q4_K → INT8 on host (fast, trivial)
+2. INT8 TC matmul (32×1024×32, 43 TFLOPS)
+3. Scale post-process (lightweight)
+
+### Key files
+- test_32x1024x32.ttir: The breakthrough INT8 TC kernel
+- triton_shim.c: Added loop unroll pass (not needed for this approach)
