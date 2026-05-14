@@ -75,6 +75,10 @@ function cuda() {
       cuMemcpyHtoD_v2: { args: ["i64", "ptr", "i64"], returns: "i32" },
       cuMemcpyDtoH_v2: { args: ["ptr", "i64", "i64"], returns: "i32" },
       cuMemFree_v2: { args: ["i64"], returns: "i32" },
+      cuEventCreate: { args: ["ptr", "u32"], returns: "i32" },
+      cuEventRecord: { args: ["i64", "i64"], returns: "i32" },
+      cuEventSynchronize: { args: ["i64"], returns: "i32" },
+      cuEventElapsedTime: { args: ["ptr", "i64", "i64"], returns: "i32" },
     }).symbols;
     _cs.cuInit(0);
     const dev = new Int32Array(1);
@@ -86,6 +90,20 @@ function cuda() {
 
 /** Export the shared CUDA context for use by external tests (avoids dual-context bugs) */
 export function getCuCtx() { return cuda(); }
+
+/** Create CUDA events for GPU-accurate timing */
+export function createCudaEvents(): { start: Buffer; stop: Buffer; elapsed: Float32Array } {
+  const cs = cuda();
+  const start = Buffer.alloc(8); cs.cuEventCreate(start, 0);
+  const stop = Buffer.alloc(8); cs.cuEventCreate(stop, 0);
+  return { start, stop, elapsed: new Float32Array(1) };
+}
+
+/** Record GPU time between two events in microseconds */
+export function gpuTimeUs(cs: any, ev: { start: Buffer; stop: Buffer; elapsed: Float32Array }): number {
+  cs.cuEventElapsedTime(ev.elapsed, Number(ev.start.readBigUInt64LE(0)), Number(ev.stop.readBigUInt64LE(0)));
+  return ev.elapsed[0] * 1000;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // Compilation
@@ -462,23 +480,56 @@ function dequantLLVM(): string {
   const body: string[] = [];
   const emit = (s: string) => body.push(`  ${s}`);
 
-  // Unrolled: for each of 16 input bytes, GEP→load, extract lo/hi nibbles, store 2 INT8 values
-  for (let i = 0; i < 16; i++) {
-    const gpB = `gp_b${i}`, bi = `b${i}`;
-    const loi = `lo${i}`, hii = `hi${i}`;
-    const loAdj = `lo_adj${i}`, hiAdj = `hi_adj${i}`;
-    const gpLo = `gp_lo_${i}`, gpHi = `gp_hi_${i}`;
+  // Load 16 input bytes as 2× i64 (vectorized)
+  emit(`%gp_v0 = getelementptr i8, ptr %inp, i32 0`);
+  emit(`%v0 = load i64, ptr %gp_v0`);
+  emit(`%gp_v1 = getelementptr i8, ptr %inp, i32 8`);
+  emit(`%v1 = load i64, ptr %gp_v1`);
 
-    emit(`%${gpB} = getelementptr i8, ptr %inp, i32 ${i}`);
-    emit(`%${bi} = load i8, ptr %${gpB}`);
-    emit(`%${loi} = and i8 %${bi}, 15`);
-    emit(`%${hii} = lshr i8 %${bi}, 4`);
-    emit(`%${loAdj} = sub i8 %${loi}, 8`);
-    emit(`%${hiAdj} = sub i8 %${hii}, 8`);
-    emit(`%${gpLo} = getelementptr i8, ptr %outp, i32 ${i * 2}`);
-    emit(`store i8 %${loAdj}, ptr %${gpLo}`);
-    emit(`%${gpHi} = getelementptr i8, ptr %outp, i32 ${i * 2 + 1}`);
-    emit(`store i8 %${hiAdj}, ptr %${gpHi}`);
+  // Extract nibbles from bytes, work with i8, then sign-extend to i32, pack and store.
+  // First, extract all 16 input bytes as i8 values.
+  // v0: bytes 0-7, v1: bytes 8-15
+  for (let i = 0; i < 16; i++) {
+    const src = i < 8 ? "v0" : "v1";
+    const pos = i < 8 ? i : i - 8;
+    const shift = pos * 8;
+    const srcVal = shift === 0 ? `%${src}` : `%vs_${src}_${pos}`;
+    if (shift > 0) emit(`%vs_${src}_${pos} = lshr i64 %${src}, ${shift}`);
+    emit(`%b${i} = trunc i64 ${srcVal} to i8`);
+
+    // Extract lo/hi nibbles, center at 0
+    emit(`%lo${i} = and i8 %b${i}, 15`);
+    emit(`%hi${i} = lshr i8 %b${i}, 4`);
+    emit(`%la${i} = sub i8 %lo${i}, 8`);
+    emit(`%ha${i} = sub i8 %hi${i}, 8`);
+  }
+
+  // Pack into i32 stores: 8× i32 = 32 output bytes
+  // Group 4 consecutive output bytes per i32
+  // Output layout: lo[0], hi[0], lo[1], hi[1], ..., lo[15], hi[15]
+  // Each i32 covers 2 input bytes = 4 output bytes: {la[g*2], ha[g*2], la[g*2+1], ha[g*2+1]}
+  for (let g = 0; g < 8; g++) {
+    const i0 = g * 2;       // first input byte
+    const i1 = g * 2 + 1;   // second input byte
+    const outOff = g * 4;   // output byte offset
+
+    // Zero-extend i8 to i32 (preserves byte value as unsigned for packing)
+    emit(`%x_la${g} = zext i8 %la${i0} to i32`);
+    emit(`%x_ha${g} = zext i8 %ha${i0} to i32`);
+    emit(`%x_lb${g} = zext i8 %la${i1} to i32`);
+    emit(`%x_hb${g} = zext i8 %ha${i1} to i32`);
+
+    // Pack: la[g*2] | (ha[g*2] << 8) | (la[g*2+1] << 16) | (ha[g*2+1] << 24)
+    emit(`%sh_ha${g} = shl i32 %x_ha${g}, 8`);
+    emit(`%sh_lb${g} = shl i32 %x_lb${g}, 16`);
+    emit(`%sh_hb${g} = shl i32 %x_hb${g}, 24`);
+    emit(`%p_${g}_0 = or i32 %x_la${g}, %sh_ha${g}`);
+    emit(`%p_${g}_1 = or i32 %p_${g}_0, %sh_lb${g}`);
+    emit(`%p_${g}_2 = or i32 %p_${g}_1, %sh_hb${g}`);
+
+    // i32 store
+    emit(`%gp_out_${g} = getelementptr i8, ptr %outp, i32 ${outOff}`);
+    emit(`store i32 %p_${g}_2, ptr %gp_out_${g}`);
   }
 
   const ir = `define void @dequant(ptr %input, ptr %output, i32 %numBlocks) {
@@ -532,10 +583,10 @@ export class DequantKernel {
   }
 
   /** Launch dequant kernel (no sync — caller must sync or chain kernels) */
-  launch(input: bigint, output: bigint, numBlocks: number): void {
+  launch(input: bigint, output: bigint, numBlocks: number, blockSize = 64): void {
     if (!this._initialized) this.load();
     const cs = cuda();
-    const gx = Math.ceil(numBlocks / 256);
+    const gx = Math.ceil(numBlocks / blockSize);
     const slotBuf = Buffer.alloc(24);
     slotBuf.writeBigUInt64LE(input, 0);
     slotBuf.writeBigUInt64LE(output, 8);
@@ -546,7 +597,7 @@ export class DequantKernel {
     kp.writeBigUInt64LE(BigInt(pp + 8), 8);
     kp.writeBigUInt64LE(BigInt(pp + 16), 16);
     kp.writeBigUInt64LE(0n, 24);
-    cs.cuLaunchKernel(Number(this._fn), gx, 1, 1, 256, 1, 1, 0, 0n, ptr(kp), null);
+    cs.cuLaunchKernel(Number(this._fn), gx, 1, 1, blockSize, 1, 1, 0, 0n, ptr(kp), null);
   }
 
   /** Launch + sync (convenience for standalone use) */
