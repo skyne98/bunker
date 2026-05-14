@@ -90,14 +90,22 @@ function cuda() {
 
 const WRAPPER = "/tmp/triton_wrap";
 
+// LD_LIBRARY_PATH for the triton shim — should match build_shim.sh
+const SHIM_ENV = {
+  LD_LIBRARY_PATH: "/nix/store/ixhlv41i2wpl84xgjcks061dz4yssbg3-zlib-1.3.2/lib:/nix/store/bfwqrbwqpbnsdbgf86gz8pn8vvddci3i-libxml2-2.13.8/lib"
+};
+
 function compileTTIR(ttir: string, numWarps: number): { ptx: string; shmem: number } {
   const f = join(tmpdir(), `k_${process.pid}_${Math.random().toString(36).slice(2)}.mlir`);
   writeFileSync(f, ttir);
-  const out = execSync(
-    `LD_LIBRARY_PATH=/nix/store/ixhlv41i2wpl84xgjcks061dz4yssbg3-zlib-1.3.2/lib:/nix/store/bfwqrbwqpbnsdbgf86gz8pn8vvddci3i-libxml2-2.13.8/lib ${WRAPPER} ${f} ${numWarps}`,
-    { cwd: __dirname, encoding: "utf-8", maxBuffer: 50 * 1024 * 1024 }
-  );
-  // Estimate shmem from tile size: roughly BM*BK*2 + BK*BN*2 bytes for f16 tiles
+  const out = execSync(`${WRAPPER} ${f} ${numWarps}`, {
+    cwd: __dirname, encoding: "utf-8", maxBuffer: 50 * 1024 * 1024,
+    env: { ...process.env, ...SHIM_ENV }
+  });
+  if (out.startsWith("ERROR:") || out.startsWith("loc(")) {
+    throw Error(`TTIR compilation failed:\n${out.substring(0, 500)}`);
+  }
+  // Shared memory size from shim is stored in a companion file; use safe default
   return { ptx: out, shmem: 32768 };
 }
 
@@ -109,142 +117,128 @@ export class KernelInstance {
   public readonly cfg: TileConfig;
   public readonly ptx: string;
   public readonly shmem: number;
+  public readonly fnName: string;
   private _mod: bigint = 0n;
   private _fn: bigint = 0n;
   private _initialized = false;
+  private _numParams = 0;
 
-  constructor(cfg: TileConfig, ptx: string, shmem: number) {
+  constructor(cfg: TileConfig, ptx: string, shmem: number, fnName = "matmul") {
     this.cfg = cfg;
     this.ptx = ptx;
     this.shmem = shmem;
+    this.fnName = fnName;
   }
 
   private ensureLoaded() {
     if (this._initialized) return;
     const cs = cuda();
     const mod = Buffer.alloc(8);
-    cs.cuModuleLoadData(mod, ptr(Buffer.from(this.ptx)));
+    cs.cuModuleLoadData(mod, Buffer.from(this.ptx + "\0"));
     this._mod = mod.readBigUInt64LE(0);
     const fn = Buffer.alloc(8);
-    cs.cuModuleGetFunction(fn, Number(this._mod), ptr(Buffer.from("matmul\0")));
+    cs.cuModuleGetFunction(fn, Number(this._mod), Buffer.from(this.fnName + "\0"));
     this._fn = fn.readBigUInt64LE(0);
+    if (this._fn === 0n) throw Error(`Function "${this.fnName}" not found in PTX`);
+    // Count params from PTX: .param directives in kernel entry
+    const m = this.ptx.match(new RegExp(`\\.visible\\s+\\.entry\\s+${this.fnName}[^)]+\\)`, "s"));
+    if (m) this._numParams = (m[0].match(/\.param/g) || []).length;
+    else this._numParams = 3; // fallback
     this._initialized = true;
   }
 
-  /** Launch the kernel. `bufs` maps argument names to typed arrays (uploaded to GPU) or numbers (passed directly). */
-  run(bufs: Record<string, ArrayBufferView | number>, dims: MatmulDims): void {
+  /** Build kernel params buffer from typed args. Returns [paramsBuf, kernelParamsArray]. */
+  private buildParams(args: (ArrayBufferView | number)[]): [Buffer, Buffer] {
+    const slots = args.map(a => {
+      const s = Buffer.alloc(8);
+      if (typeof a === "number") { s.writeInt32LE(a, 0); return s; }
+      // Pointer arg: write device address placeholder (caller fills)
+      return s;
+    });
+    // Pad to numParams + null terminator
+    while (slots.length < this._numParams) slots.push(Buffer.alloc(8));
+    const pb = Buffer.concat(slots);
+    return [pb, Buffer.alloc((slots.length + 1) * 8)];
+  }
+
+  /** Launch the kernel. `args` are positional params matching the TTIR function signature. */
+  run(args: (ArrayBufferView | number)[], dims: MatmulDims): void {
     this.ensureLoaded();
     const cs = cuda();
 
-    // Allocate GPU memory for each buffer arg, upload data
-    const devPtrs: Map<string, bigint> = new Map();
-    const devAllocs: bigint[] = [];
-    const argSlots: Buffer[] = [];
+    // Allocate + upload each ArrayBufferView arg
+    const devAddrs: bigint[] = [];
+    const gpuArgs: (number | bigint)[] = [];
 
-    for (const [name, val] of Object.entries(bufs)) {
-      if (typeof val === "number") {
-        const slot = Buffer.alloc(8);
-        slot.writeInt32LE(val, 0);
-        argSlots.push(slot);
-      } else {
-        const db = Buffer.alloc(8);
-        const sz = BigInt(val.byteLength);
-        cs.cuMemAlloc_v2(db, sz);
-        const dp = db.readBigUInt64LE(0);
-        cs.cuMemcpyHtoD_v2(Number(dp), val, sz);
-        devPtrs.set(name, dp);
-        devAllocs.push(dp);
-        const slot = Buffer.alloc(8);
-        slot.writeBigUInt64LE(dp, 0);
-        argSlots.push(slot);
-      }
+    for (const a of args) {
+      if (typeof a === "number") { gpuArgs.push(a); continue; }
+      const db = Buffer.alloc(8);
+      const sz = BigInt(a.byteLength);
+      cs.cuMemAlloc_v2(db, sz);
+      const dp = db.readBigUInt64LE(0);
+      cs.cuMemcpyHtoD_v2(Number(dp), a, sz);
+      devAddrs.push(dp);
+      gpuArgs.push(dp);
     }
 
-    // Build kernel params array
-    const pb = Buffer.concat(argSlots.map(s => {
-      const buf = Buffer.alloc(8);
-      // Each param is an 8-byte slot with the pointer or value
-      return s;
-    }));
-    
-    // Pad to 5 params + null (CUDA kernel expects this many)
-    while (argSlots.length < 5) {
-      const empty = Buffer.alloc(8);
-      argSlots.push(empty);
-    }
+    // Build flat param buffer + pointer array
+    const slotBuf = Buffer.alloc(gpuArgs.length * 8);
+    gpuArgs.forEach((v, i) => {
+      if (typeof v === "bigint") slotBuf.writeBigUInt64LE(v, i * 8);
+      else slotBuf.writeInt32LE(v, i * 8);
+    });
 
-    const pp = Number(ptr(pb));
-    const kp = Buffer.alloc((argSlots.length + 1) * 8);
-    for (let i = 0; i < argSlots.length; i++) {
-      kp.writeBigUInt64LE(pp > 0 ? BigInt(pp + i * 8) : 0n, i * 8);
-    }
-    kp.writeBigUInt64LE(0n, argSlots.length * 8);
-
-    // Compute grid dimensions
+    // Build kernel params pointer array
+    const kp = Buffer.alloc((this._numParams + 1) * 8);
     const gx = Math.ceil(dims.M / this.cfg.BM);
     const gy = Math.ceil(dims.N / this.cfg.BN);
-    const blockThreads = this.cfg.numWarps * 32;
+    const bt = this.cfg.numWarps * 32;
 
-    // Launch
-    cs.cuLaunchKernel(
-      Number(this._fn), gx, gy, 1, blockThreads, 1, 1, this.shmem, 0n, ptr(kp), null
-    );
-    cs.cuCtxSynchronize();
+    cs.cuLaunchKernel(Number(this._fn), gx, gy, 1, bt, 1, 1, this.shmem, 0n,
+      Buffer.from(kp.buffer), null);
 
-    // Readback results for ArrayBuffer outputs
-    for (const [name, val] of Object.entries(bufs)) {
-      if (typeof val !== "number") {
-        const dp = devPtrs.get(name)!;
-        cs.cuMemcpyDtoH_v2(ptr(Buffer.from((val as ArrayBufferView).buffer)), Number(dp), BigInt(val.byteLength));
+    // Wait
+    const syncRet = cs.cuCtxSynchronize();
+    if (syncRet !== 0) throw Error(`cuCtxSynchronize failed: ${syncRet}`);
+
+    // Readback
+    let ai = 0;
+    for (const a of args) {
+      if (typeof a !== "number") {
+        cs.cuMemcpyDtoH_v2(a, Number(devAddrs[ai]), BigInt(a.byteLength));
+        ai++;
       }
     }
 
-    // Free device memory
-    for (const dp of devAllocs) cs.cuMemFree_v2(Number(dp));
+    for (const dp of devAddrs) cs.cuMemFree_v2(Number(dp));
   }
 
   /** Benchmark this kernel for given dimensions. Returns time in ms. */
   benchmark(dims: MatmulDims, iters = 10): number {
     this.ensureLoaded();
     const cs = cuda();
-
-    // Allocate dummy data
-    const sz = BigInt(128 * 1024 * 1024);
-    const dA = Buffer.alloc(8); cs.cuMemAlloc_v2(dA, sz);
-    const dB = Buffer.alloc(8); cs.cuMemAlloc_v2(dB, sz);
-    const dC = Buffer.alloc(8); cs.cuMemAlloc_v2(dC, sz);
-
-    const pb = Buffer.alloc(5 * 8);
-    pb.writeBigUInt64LE(dA.readBigUInt64LE(0), 0);
-    pb.writeBigUInt64LE(dB.readBigUInt64LE(0), 8);
-    pb.writeBigUInt64LE(dC.readBigUInt64LE(0), 16);
-    const kp = Buffer.alloc(6 * 8);
-    const pp = Number(ptr(pb));
-    for (let i = 0; i < 5; i++) kp.writeBigUInt64LE(BigInt(pp + i * 8), i * 8);
-    kp.writeBigUInt64LE(0n, 40);
+    const SZ = BigInt(256 * 1024 * 1024);
+    const allocs = [Buffer.alloc(8), Buffer.alloc(8), Buffer.alloc(8)];
+    allocs.forEach(b => cs.cuMemAlloc_v2(b, SZ));
 
     const gx = Math.ceil(dims.M / this.cfg.BM);
     const gy = Math.ceil(dims.N / this.cfg.BN);
-    const blockThreads = this.cfg.numWarps * 32;
-    const totalFlops = BigInt(2) * BigInt(gx * gy) * BigInt(this.cfg.BM) * BigInt(this.cfg.BN) * BigInt(this.cfg.BK);
+    const bt = this.cfg.numWarps * 32;
 
     // Warmup
-    for (let w = 0; w < 3; w++) cs.cuLaunchKernel(Number(this._fn), gx, gy, 1, blockThreads, 1, 1, this.shmem, 0n, ptr(kp), null);
+    for (let w = 0; w < 3; w++) cs.cuLaunchKernel(Number(this._fn), gx, gy, 1, bt, 1, 1, this.shmem, 0n, null, null);
     cs.cuCtxSynchronize();
 
     const times: number[] = [];
     for (let i = 0; i < iters; i++) {
       const t0 = performance.now();
-      const lr = cs.cuLaunchKernel(Number(this._fn), gx, gy, 1, blockThreads, 1, 1, this.shmem, 0n, ptr(kp), null);
+      const lr = cs.cuLaunchKernel(Number(this._fn), gx, gy, 1, bt, 1, 1, this.shmem, 0n, null, null);
       if (lr !== 0) break;
       cs.cuCtxSynchronize();
       times.push(performance.now() - t0);
     }
 
-    cs.cuMemFree_v2(Number(dA.readBigUInt64LE(0)));
-    cs.cuMemFree_v2(Number(dB.readBigUInt64LE(0)));
-    cs.cuMemFree_v2(Number(dC.readBigUInt64LE(0)));
-
+    allocs.forEach(b => cs.cuMemFree_v2(Number(b.readBigUInt64LE(0))));
     if (times.length === 0) return Infinity;
     return times.reduce((a, b) => a + b, 0) / times.length;
   }
@@ -258,15 +252,18 @@ export class KernelTemplate {
   public readonly name: string;
   public readonly generator: TTIRGenerator;
   public readonly defaultConfig: TileConfig;
+  public readonly fnName: string;
   public cache = new Map<string, KernelInstance>();
 
   constructor(opts: {
     name: string;
     generator: TTIRGenerator;
     defaults?: Partial<TileConfig>;
+    fnName?: string;
   }) {
     this.name = opts.name;
     this.generator = opts.generator;
+    this.fnName = opts.fnName ?? this.name;
     this.defaultConfig = {
       BM: 128, BN: 128, BK: 32, numWarps: 8,
       ...opts.defaults,
@@ -282,7 +279,7 @@ export class KernelTemplate {
 
     const ttir = this.generator(full);
     const { ptx, shmem } = compileTTIR(ttir, full.numWarps);
-    const inst = new KernelInstance(full, ptx, shmem);
+    const inst = new KernelInstance(full, ptx, shmem, this.fnName);
     this.cache.set(key, inst);
     return inst;
   }
@@ -292,7 +289,7 @@ export class KernelTemplate {
     dims: MatmulDims,
     searchSpace?: Partial<TileConfig>[]
   ): Promise<{ config: TileConfig; instance: KernelInstance; timeMs: number }> {
-    const space = searchSpace ?? DEFAULT_SEARCH_SPACE;
+    const space = searchSpace ?? (this.name.includes("i8") ? INT8_SEARCH : FP16_SEARCH);
 
     let best: { config: TileConfig; instance: KernelInstance; timeMs: number } | null = null;
 
@@ -321,19 +318,30 @@ export class KernelTemplate {
 // Default search space
 // ═══════════════════════════════════════════════════════════════════
 
-const DEFAULT_SEARCH_SPACE: Partial<TileConfig>[] = [
+/** Default search space for FP16 matmul autotuning. */
+const FP16_SEARCH: Partial<TileConfig>[] = [
   { BM: 16, BN: 16, BK: 32, numWarps: 4 },
-  { BM: 32, BN: 16, BK: 32, numWarps: 4 },
   { BM: 32, BN: 32, BK: 32, numWarps: 4 },
-  { BM: 16, BN: 16, BK: 1024, numWarps: 4 },
   { BM: 32, BN: 16, BK: 1024, numWarps: 4 },
   { BM: 32, BN: 32, BK: 1024, numWarps: 4 },
   { BM: 64, BN: 64, BK: 32, numWarps: 4 },
   { BM: 64, BN: 64, BK: 1024, numWarps: 8 },
   { BM: 128, BN: 128, BK: 32, numWarps: 8 },
   { BM: 128, BN: 128, BK: 64, numWarps: 8 },
-  { BM: 64, BN: 128, BK: 32, numWarps: 8 },
   { BM: 128, BN: 64, BK: 32, numWarps: 8 },
+];
+
+/** Default search space for INT8 matmul autotuning. */
+const INT8_SEARCH: Partial<TileConfig>[] = [
+  { BM: 16, BN: 16, BK: 32, numWarps: 4 },
+  { BM: 32, BN: 16, BK: 32, numWarps: 4 },
+  { BM: 32, BN: 32, BK: 32, numWarps: 4 },
+  { BM: 16, BN: 16, BK: 256, numWarps: 4 },
+  { BM: 32, BN: 32, BK: 256, numWarps: 4 },
+  { BM: 16, BN: 16, BK: 1024, numWarps: 4 },
+  { BM: 32, BN: 32, BK: 1024, numWarps: 4 },
+  { BM: 32, BN: 32, BK: 512, numWarps: 8 },
+  { BM: 64, BN: 64, BK: 256, numWarps: 8 },
 ];
 
 // ═══════════════════════════════════════════════════════════════════
@@ -364,19 +372,19 @@ export function matmulTTIR(cfg: TileConfig, stride = 4096): string {
 }`;
 }
 
-/** INT8 tensor core matmul — 32×1024×32, no boundaryCheck, 33 TFLOPS on RTX 3090
+/** INT8 tensor core matmul — no boundaryCheck, 33 TFLOPS on RTX 3090
  *  Requires grid to exactly fit the matrix (no boundary padding needed).
  *  Without boundaryCheck, PTX has no predicated loads → all threads converge at
  *  all bar.sync → no deadlock (unlike scf.for-based K-loop ≥32×32 tiles). */
-export function int8MatmulTTIR(cfg: TileConfig): string {
+export function int8MatmulTTIR(cfg: TileConfig, stride = 1024): string {
   const { BM=32, BN=32, BK=1024, numWarps=4 } = cfg;
   return `module attributes {"ttg.num-warps" = ${numWarps} : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @matmul(%A: !tt.ptr<i8>, %B: !tt.ptr<i8>, %C: !tt.ptr<i32>) {
-    %c0 = arith.constant 0 : i32 %cN_i32 = arith.constant ${BM} : i32
+    %c0 = arith.constant 0 : i32 %cBM = arith.constant ${BM} : i32 %cBN = arith.constant ${BN} : i32
     %c0_i64 = arith.constant 0 : i64 %c1_i64 = arith.constant 1 : i64
-    %cBK = arith.constant ${BK} : i64 %cN = arith.constant ${BN} : i64 %cS = arith.constant 1024 : i64
+    %cBK = arith.constant ${BK} : i64 %cS = arith.constant ${stride} : i64
     %px = tt.get_program_id x : i32 %py = tt.get_program_id y : i32
-    %bm = arith.muli %px, %cN_i32 : i32 %bn = arith.muli %py, %cN_i32 : i32
+    %bm = arith.muli %px, %cBM : i32 %bn = arith.muli %py, %cBN : i32
     %z = arith.constant dense<0> : tensor<${BM}x${BN}xi32>
     %tA = tt.make_tensor_ptr %A,[%cS,%cS],[%cS,%c1_i64],[%bm,%c0]{order=array<i32:1,0>}:!tt.ptr<tensor<${BM}x${BK}xi8>>
     %tB = tt.make_tensor_ptr %B,[%cS,%cS],[%cS,%c1_i64],[%c0,%bn]{order=array<i32:1,0>}:!tt.ptr<tensor<${BK}x${BN}xi8>>
@@ -399,6 +407,7 @@ export const matmul_i8 = new KernelTemplate({
   name: "matmul_i8",
   generator: int8MatmulTTIR,
   defaults: { BM: 32, BN: 32, BK: 1024, numWarps: 4 },
+  fnName: "matmul",
 });
 
 // ═══════════════════════════════════════════════════════════════════
