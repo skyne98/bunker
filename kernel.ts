@@ -416,83 +416,62 @@ export function int8MatmulTTIR(cfg: TileConfig, stride = 1024): string {
 }`;
 }
 
-/** Fused Q4_K dequant + TC matmul in a single TTIR kernel.
- *  Loads all Q4_K blocks as a 2D tensor [BM×16] with strided make_tensor_ptr,
- *  dequantizes via element-wise arith ops, interleaves lo/hi via join+reshape,
- *  scf.for K-loop with iter_args, tt.dot for tensor core matmul. */
+/** Fused Q4_K dequant + TC matmul in a single TTIR kernel — no K-loop, full BK=1024.
+ *  Loads all Q4_K blocks as a 3D tensor [BM×32×16] via strided make_tensor_ptr,
+ *  dequantizes element-wise, interleaves via join+reshape, single tt.dot. */
 export function fusedDequantMatmulTTIR(cfg: TileConfig, stride = 1024): string {
-  const { BM=32, BN=32, BK=32, numWarps=4 } = cfg;
-  const K_ITER = stride / BK;
-  const ROW_STRIDE = 32 * 20; // 640 bytes between Q4_K blocks of consecutive rows
+  const { BM=32, BN=32, numWarps=4 } = cfg;
+  const BK = stride; // BK = K = 1024 for single-shot matmul
+  const ROW_STRIDE = 32 * 20;   // 640: bytes between Q4_K blocks of consecutive rows
+  const KB = stride / 32;        // 32: K-blocks per row
 
   return `module attributes {"ttg.num-warps" = ${numWarps} : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @fused(%Q: !tt.ptr<i8>, %B: !tt.ptr<i8>, %C: !tt.ptr<i32>) {
     %c0_i32 = arith.constant 0 : i32
-    %c1_index = arith.constant 1 : index
     %c32_i32 = arith.constant 32 : i32
-    %c1024 = arith.constant 1024 : i32
-    %c0_i64 = arith.constant 0 : i64
-    %c1_i64 = arith.constant 1 : i64
-    %c640 = arith.constant ${ROW_STRIDE} : i64
-    %c16 = arith.constant 16 : i64
+    %c1024 = arith.constant ${stride} : i32
     %cS = arith.constant ${stride} : i64
-    %c15 = arith.constant dense<15> : tensor<${BM}x16xi8>
-    %c8 = arith.constant dense<8> : tensor<${BM}x16xi8>
-    %c4 = arith.constant dense<4> : tensor<${BM}x16xi8>
-    %z_acc = arith.constant dense<0> : tensor<${BM}x${BN}xi32>
+    %c1_i64 = arith.constant 1 : i64
+    %c20_i64 = arith.constant 20 : i64
+    %c20_i32 = arith.constant 20 : i32
+    %c640_i64 = arith.constant ${ROW_STRIDE} : i64
+    %c16_i64 = arith.constant 16 : i64
+    %c32_i64 = arith.constant ${KB} : i64
+    %cBM_i64 = arith.constant ${BM} : i64
+    %c15 = arith.constant dense<15> : tensor<${BM}x${KB}x16xi8>
+    %c8 = arith.constant dense<8> : tensor<${BM}x${KB}x16xi8>
+    %c4 = arith.constant dense<4> : tensor<${BM}x${KB}x16xi8>
+    %z = arith.constant dense<0> : tensor<${BM}x${BN}xi32>
     %px = tt.get_program_id x : i32 %py = tt.get_program_id y : i32
     %bm = arith.muli %px, %c32_i32 : i32 %bn = arith.muli %py, %c32_i32 : i32
 
-    %c0_idx = arith.constant 0 : index
-    %cKiter_idx = arith.constant ${K_ITER} : index
-    %acc = scf.for %k_idx = %c0_idx to %cKiter_idx step %c1_index iter_args(%acc_iter = %z_acc) -> (tensor<${BM}x${BN}xi32>) {
-      %k = arith.index_cast %k_idx : index to i32
-      %k_off = arith.muli %k, %c32_i32 : i32
-      %k_off_i64 = arith.extsi %k_off : i32 to i64
-      %bm_i64 = arith.extsi %bm : i32 to i64
+    // Load B: 1024×32 INT8 at B[1024×1024], offset [0, bn]
+    %tB = tt.make_tensor_ptr %B,[%cS,%cS],[%cS,%c1_i64],[%c0_i32,%bn]{order=array<i32:1,0>}:!tt.ptr<tensor<${BK}x${BN}xi8>>
+    %b = tt.load %tB:!tt.ptr<tensor<${BK}x${BN}xi8>>
 
-      // Load B tile: BK×BN INT8 at B[1024×1024], offset [k_off, bn]
-      %tB = tt.make_tensor_ptr %B,[%cS,%cS],[%cS,%c1_i64],[%k_off,%bn]{order=array<i32:1,0>}:!tt.ptr<tensor<${BK}x${BN}xi8>>
-      %b_tile = tt.load %tB:!tt.ptr<tensor<${BK}x${BN}xi8>>
+    // Load all Q4_K blocks as 3D tensor: [BM, KB, 16] with strides [640, 20, 1]
+    // block_byte_base = (bm * 32) * 20 = bm * 640
+    %bm32 = arith.muli %bm, %c32_i32 : i32    // bm * 32
+    %blk_off = arith.muli %bm32, %c20_i32 : i32  // (bm * 32) * 20 = bm * 640
+    %tQ = tt.make_tensor_ptr %Q,[%cBM_i64,%c32_i64,%c16_i64],[%c640_i64,%c20_i64,%c1_i64],[%blk_off,%c0_i32,%c0_i32]{order=array<i32:2,1,0>}:!tt.ptr<tensor<${BM}x${KB}x16xi8>>
+    %q3 = tt.load %tQ:!tt.ptr<tensor<${BM}x${KB}x16xi8>>
 
-      // Load all BM Q4_K blocks as a 2D tensor [BM×16] with row stride 640
-      // First block index for this tile: (bm * 1024 + k_off) / 32 = bm * 32 + k
-      %tile_blk = arith.addi %bm, %k : i32  // simplified: (bm * 32 + k) but wait, bm is row * 32, k is iteration
-      // Actually: first block = (bm + k) where bm is row*32 and k is k_iter
-      // But bm is already row*32, so bm + k = row_start*32 + k_iter
-      // Hmm, bm = px * 32. For block index: (px*32 * 1024 + k_off) / 32 = px*32*32 + k
-      // = px*1024 + k. Since px*1024 is the row offset in the matrix, bm=px*32.
-      // Block index = px*32*32 + k (since k_off = k*32, and 1024/32 = 32 blocks per row)
-      // So tile_blk_off = px*32*32 + k = px*1024 + k
-      // Since bm = px*32, px*1024 = bm*32
-      %bm32 = arith.muli %bm, %c32_i32 : i32  // bm * 32 = px * 1024
-      %tile_blk_off = arith.addi %bm32, %k : i32  // px*1024 + k
-      %c20 = arith.constant 20 : i32
-      %tile_byte_off2 = arith.muli %tile_blk_off, %c20 : i32
-      %cBM_i64 = arith.constant ${BM} : i64
-      %c640_i64 = arith.constant ${ROW_STRIDE} : i64
-      %tQ = tt.make_tensor_ptr %Q,[%cBM_i64,%c16],[%c640_i64,%c1_i64],[%tile_byte_off2,%c0_i32]{order=array<i32:1,0>}:!tt.ptr<tensor<${BM}x16xi8>>
-      %q_packed = tt.load %tQ:!tt.ptr<tensor<${BM}x16xi8>>
+    // Dequant: extract lo/hi nibbles, center at 0
+    %lo = arith.andi %q3, %c15 : tensor<${BM}x${KB}x16xi8>
+    %hs = arith.shrui %q3, %c4 : tensor<${BM}x${KB}x16xi8>
+    %hi = arith.andi %hs, %c15 : tensor<${BM}x${KB}x16xi8>
+    %lc = arith.subi %lo, %c8 : tensor<${BM}x${KB}x16xi8>
+    %hc = arith.subi %hi, %c8 : tensor<${BM}x${KB}x16xi8>
 
-      // Dequant: extract lo/hi nibbles, center at 0
-      %q_lo = arith.andi %q_packed, %c15 : tensor<${BM}x16xi8>
-      %q_hi_tmp = arith.shrui %q_packed, %c4 : tensor<${BM}x16xi8>
-      %q_hi = arith.andi %q_hi_tmp, %c15 : tensor<${BM}x16xi8>
-      %q_lo_c = arith.subi %q_lo, %c8 : tensor<${BM}x16xi8>
-      %q_hi_c = arith.subi %q_hi, %c8 : tensor<${BM}x16xi8>
+    // Interleave lo/hi → reshape to BM×BK
+    %jn = tt.join %lc, %hc : tensor<${BM}x${KB}x16xi8> -> tensor<${BM}x${KB}x16x2xi8>
+    %a = tt.reshape %jn : tensor<${BM}x${KB}x16x2xi8> -> tensor<${BM}x${BK}xi8>
 
-      // Interleave lo/hi along the last dimension: tensor<BM×16×2xi8>
-      %q_joined = tt.join %q_lo_c, %q_hi_c : tensor<${BM}x16xi8> -> tensor<${BM}x16x2xi8>
-
-      // Reshape to BM×BK (16×2 = 32 = BK)
-      %a_tile = tt.reshape %q_joined : tensor<${BM}x16x2xi8> -> tensor<${BM}x${BK}xi8>
-
-      %d = tt.dot %a_tile, %b_tile, %acc_iter : tensor<${BM}x${BK}xi8> * tensor<${BK}x${BN}xi8> -> tensor<${BM}x${BN}xi32>
-      scf.yield %d : tensor<${BM}x${BN}xi32>
-    }
+    // Single tt.dot (no K-loop needed)
+    %d = tt.dot %a, %b, %z : tensor<${BM}x${BK}xi8> * tensor<${BK}x${BN}xi8> -> tensor<${BM}x${BN}xi32>
 
     %tC = tt.make_tensor_ptr %C,[%cS,%cS],[%cS,%c1_i64],[%bm,%bn]{order=array<i32:1,0>}:!tt.ptr<tensor<${BM}x${BN}xi32>>
-    tt.store %tC,%acc:!tt.ptr<tensor<${BM}x${BN}xi32>>
+    tt.store %tC,%d:!tt.ptr<tensor<${BM}x${BN}xi32>>
     tt.return
   }
 }`;
