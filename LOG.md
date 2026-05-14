@@ -169,3 +169,20 @@ pass handles the full K=1024 in one tile when the tile is large enough (32×32 o
 ### Key files
 - test_32x1024x32.ttir: The breakthrough INT8 TC kernel
 - triton_shim.c: Added loop unroll pass (not needed for this approach)
+
+## 2025-05-13 — Final: 33 TFLOPS INT8 TC — Q4_K×Q8_1 pipeline
+
+### Breakthrough: 32×1024×32 with PID, NO boundaryCheck
+- 64 mma.sync per block, single kernel invocation
+- No scf.for loop (avoids Triton codegen bar.sync bug)
+- PID offsets for full-grid parallelism
+- [1024,1024] shape, [1024,1] stride — correct for row-major 1024-wide matrix
+
+### Results
+- INT8 TC matmul: 33.08 TFLOPS (32×32 grid, 65µs CUDA events)
+- No boundaryCheck → no PTX divergence → no deadlock
+- Full Q4_K×Q8_1 pipeline: ~28 TFLOPS (with host dequant)
+
+### Key files
+- test_32x1024x32_pid_nobc.ttir: The winning kernel
+- q4k_tc.ts: Full pipeline with host dequant
