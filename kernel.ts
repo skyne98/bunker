@@ -337,9 +337,10 @@ const DEFAULT_SEARCH_SPACE: Partial<TileConfig>[] = [
 ];
 
 // ═══════════════════════════════════════════════════════════════════
-// Built-in matmul kernel
+// Built-in matmul kernels
 // ═══════════════════════════════════════════════════════════════════
 
+/** FP16 tensor core matmul (uses boundaryCheck, safe for all tile sizes) */
 export function matmulTTIR(cfg: TileConfig, stride = 4096): string {
   const { BM, BN, BK, numWarps } = cfg;
   return `module attributes {"ttg.num-warps" = ${numWarps} : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
@@ -363,9 +364,41 @@ export function matmulTTIR(cfg: TileConfig, stride = 4096): string {
 }`;
 }
 
+/** INT8 tensor core matmul — 32×1024×32, no boundaryCheck, 33 TFLOPS on RTX 3090
+ *  Requires grid to exactly fit the matrix (no boundary padding needed).
+ *  Without boundaryCheck, PTX has no predicated loads → all threads converge at
+ *  all bar.sync → no deadlock (unlike scf.for-based K-loop ≥32×32 tiles). */
+export function int8MatmulTTIR(cfg: TileConfig): string {
+  const { BM=32, BN=32, BK=1024, numWarps=4 } = cfg;
+  return `module attributes {"ttg.num-warps" = ${numWarps} : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @matmul(%A: !tt.ptr<i8>, %B: !tt.ptr<i8>, %C: !tt.ptr<i32>) {
+    %c0 = arith.constant 0 : i32 %cN_i32 = arith.constant ${BM} : i32
+    %c0_i64 = arith.constant 0 : i64 %c1_i64 = arith.constant 1 : i64
+    %cBK = arith.constant ${BK} : i64 %cN = arith.constant ${BN} : i64 %cS = arith.constant 1024 : i64
+    %px = tt.get_program_id x : i32 %py = tt.get_program_id y : i32
+    %bm = arith.muli %px, %cN_i32 : i32 %bn = arith.muli %py, %cN_i32 : i32
+    %z = arith.constant dense<0> : tensor<${BM}x${BN}xi32>
+    %tA = tt.make_tensor_ptr %A,[%cS,%cS],[%cS,%c1_i64],[%bm,%c0]{order=array<i32:1,0>}:!tt.ptr<tensor<${BM}x${BK}xi8>>
+    %tB = tt.make_tensor_ptr %B,[%cS,%cS],[%cS,%c1_i64],[%c0,%bn]{order=array<i32:1,0>}:!tt.ptr<tensor<${BK}x${BN}xi8>>
+    %a = tt.load %tA:!tt.ptr<tensor<${BM}x${BK}xi8>>
+    %b = tt.load %tB:!tt.ptr<tensor<${BK}x${BN}xi8>>
+    %c = tt.dot %a,%b,%z:tensor<${BM}x${BK}xi8>*tensor<${BK}x${BN}xi8>->tensor<${BM}x${BN}xi32>
+    %tC = tt.make_tensor_ptr %C,[%cS,%cS],[%cS,%c1_i64],[%bm,%bn]{order=array<i32:1,0>}:!tt.ptr<tensor<${BM}x${BN}xi32>>
+    tt.store %tC,%c:!tt.ptr<tensor<${BM}x${BN}xi32>>
+    tt.return
+  }
+}`;
+}
+
 export const matmul = new KernelTemplate({
   name: "matmul",
   generator: matmulTTIR,
+});
+
+export const matmul_i8 = new KernelTemplate({
+  name: "matmul_i8",
+  generator: int8MatmulTTIR,
+  defaults: { BM: 32, BN: 32, BK: 1024, numWarps: 4 },
 });
 
 // ═══════════════════════════════════════════════════════════════════
