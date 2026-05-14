@@ -186,3 +186,30 @@ pass handles the full K=1024 in one tile when the tile is large enough (32×32 o
 ### Key files
 - test_32x1024x32_pid_nobc.ttir: The winning kernel
 - q4k_tc.ts: Full pipeline with host dequant
+
+## Final: Q4_K×Q8_1 pipeline — 33 TFLOPS TC matmul core
+
+### Pipeline
+```
+Q4_K (VRAM, packed 4-bit)         Q8_1 (VRAM, INT8 + scale)
+  │                                  │
+  ▼                                  ▼
+Dequant kernel (on-device)        Already INT8
+16 bytes→32 INT8 per thread         │
+  │                                  │
+  └────────────────┬─────────────────┘
+                   ▼
+         INT8 TC matmul (32×1024×32)
+         64 mma.sync, no boundaryCheck
+         33 TFLOPS, single invocation
+                   ▼
+              INT32 output
+                   │
+                   ▼
+         Scale post-process → FP32
+```
+
+### Key files
+- test_32x1024x32_pid_nobc.ttir: Winning INT8 TC kernel (33 TFLOPS)
+- dequant kernel: DSL-based (one thread per Q4_K block, nibble extraction)
+- q4k_final2.ts: Complete two-kernel pipeline
