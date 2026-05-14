@@ -3,7 +3,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TRITON_LLVM="/nix/store/9k8wp0i929q44248fjgd55x80jjawcfv-triton-llvm-22.0.0-triton"
+TRITON_LLVM="/nix/store/9nijn351bg6n9iwq1i4k1vq29lgwmabs-triton-llvm-22.0.0-unstable-2025-09-26"
 TRITON_LLVM_DEV=""
 TRITON_SRC="/tmp/triton-src"
 BUILD_DIR="/tmp/triton-cmake-build"

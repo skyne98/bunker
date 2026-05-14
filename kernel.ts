@@ -84,6 +84,9 @@ function cuda() {
   return _cs;
 }
 
+/** Export the shared CUDA context for use by external tests (avoids dual-context bugs) */
+export function getCuCtx() { return cuda(); }
+
 // ═══════════════════════════════════════════════════════════════════
 // Compilation
 // ═══════════════════════════════════════════════════════════════════
@@ -95,7 +98,7 @@ const SHIM_ENV = {
   LD_LIBRARY_PATH: "/nix/store/ixhlv41i2wpl84xgjcks061dz4yssbg3-zlib-1.3.2/lib:/nix/store/bfwqrbwqpbnsdbgf86gz8pn8vvddci3i-libxml2-2.13.8/lib"
 };
 
-function compileTTIR(ttir: string, numWarps: number): { ptx: string; shmem: number } {
+export function compileTTIR(ttir: string, numWarps: number): { ptx: string; shmem: number } {
   const f = join(tmpdir(), `k_${process.pid}_${Math.random().toString(36).slice(2)}.mlir`);
   writeFileSync(f, ttir);
   const out = execSync(`${WRAPPER} ${f} ${numWarps}`, {
@@ -396,6 +399,161 @@ export function int8MatmulTTIR(cfg: TileConfig, stride = 1024): string {
     tt.return
   }
 }`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Q4_K Dequant kernel (LLVM IR → PTX)
+// ═══════════════════════════════════════════════════════════════════
+
+const LLVM = "/nix/store/6r234y6pkbyyr8pk1wh7nfsmnzdxyswx-llvm-19.1.7-lib/lib/libLLVM-19.so";
+
+let _llvmSymbols: any = null;
+function llvmSymbols() {
+  if (!_llvmSymbols) {
+    _llvmSymbols = dlopen(LLVM, {
+      LLVMContextCreate: { args: [], returns: "pointer" },
+      LLVMParseIRInContext: { args: ["pointer", "pointer", "pointer", "pointer"], returns: "i32" },
+      LLVMCreateMemoryBufferWithMemoryRange: { args: ["pointer", "i64", "pointer", "i32"], returns: "pointer" },
+      LLVMGetTargetFromTriple: { args: ["pointer", "pointer", "pointer"], returns: "i32" },
+      LLVMCreateTargetMachine: { args: ["pointer", "pointer", "pointer", "pointer", "i32", "i32", "i32"], returns: "pointer" },
+      LLVMTargetMachineEmitToMemoryBuffer: { args: ["pointer", "pointer", "i32", "pointer", "pointer"], returns: "i32" },
+      LLVMGetBufferSize: { args: ["pointer"], returns: "i64" },
+      LLVMGetBufferStart: { args: ["pointer"], returns: "pointer" },
+      LLVMInitializeNVPTXTargetInfo: { args: [], returns: "void" },
+      LLVMInitializeNVPTXTarget: { args: [], returns: "void" },
+      LLVMInitializeNVPTXTargetMC: { args: [], returns: "void" },
+      LLVMInitializeNVPTXAsmPrinter: { args: [], returns: "void" },
+    }).symbols;
+    _llvmSymbols.LLVMInitializeNVPTXTargetInfo();
+    _llvmSymbols.LLVMInitializeNVPTXTarget();
+    _llvmSymbols.LLVMInitializeNVPTXTargetMC();
+    _llvmSymbols.LLVMInitializeNVPTXAsmPrinter();
+  }
+  return _llvmSymbols;
+}
+
+function compileLLVM(src: string): string {
+  // Debug: write IR to file
+  try { writeFileSync("/tmp/dequant_debug.ll", src); } catch {}
+  const ls = llvmSymbols();
+  const ctx = ls.LLVMContextCreate();
+  const irBuf = Buffer.from(src + "\0");
+  const mb = ls.LLVMCreateMemoryBufferWithMemoryRange(
+    ptr(irBuf), BigInt(irBuf.length - 1), ptr(Buffer.from("k.ll\0")), 1);
+  const ma = new BigUint64Array(1);
+  if (ls.LLVMParseIRInContext(ctx, mb, ptr(ma), ptr(new BigUint64Array(1))))
+    throw Error("LLVM IR parse failed");
+  const mod = Number(ma[0]);
+  const tp = Buffer.from("nvptx64-nvidia-cuda\0");
+  const ta = new BigUint64Array(1);
+  ls.LLVMGetTargetFromTriple(ptr(tp), ptr(ta), ptr(new BigUint64Array(1)));
+  const tm = ls.LLVMCreateTargetMachine(Number(ta[0]), ptr(tp),
+    ptr(Buffer.from("sm_86\0")), ptr(Buffer.from("\0")), 2, 0, 0);
+  const pa = new BigUint64Array(1);
+  ls.LLVMTargetMachineEmitToMemoryBuffer(tm, mod, 0, ptr(new BigUint64Array(1)), ptr(pa));
+  return new CString(ls.LLVMGetBufferStart(Number(pa[0])), 0,
+    Number(ls.LLVMGetBufferSize(Number(pa[0])))).toString();
+}
+
+/** Generate LLVM IR for Q4_K dequant kernel.
+ *  One thread per Q4_K block. Each block: 16 packed bytes → 32 INT8 values.
+ *  Grid = ceil(numBlocks / 256), block = 256 threads. */
+function dequantLLVM(): string {
+  const body: string[] = [];
+  const emit = (s: string) => body.push(`  ${s}`);
+
+  // Unrolled: for each of 16 input bytes, GEP→load, extract lo/hi nibbles, store 2 INT8 values
+  for (let i = 0; i < 16; i++) {
+    const gpB = `gp_b${i}`, bi = `b${i}`;
+    const loi = `lo${i}`, hii = `hi${i}`;
+    const loAdj = `lo_adj${i}`, hiAdj = `hi_adj${i}`;
+    const gpLo = `gp_lo_${i}`, gpHi = `gp_hi_${i}`;
+
+    emit(`%${gpB} = getelementptr i8, ptr %inp, i32 ${i}`);
+    emit(`%${bi} = load i8, ptr %${gpB}`);
+    emit(`%${loi} = and i8 %${bi}, 15`);
+    emit(`%${hii} = lshr i8 %${bi}, 4`);
+    emit(`%${loAdj} = sub i8 %${loi}, 8`);
+    emit(`%${hiAdj} = sub i8 %${hii}, 8`);
+    emit(`%${gpLo} = getelementptr i8, ptr %outp, i32 ${i * 2}`);
+    emit(`store i8 %${loAdj}, ptr %${gpLo}`);
+    emit(`%${gpHi} = getelementptr i8, ptr %outp, i32 ${i * 2 + 1}`);
+    emit(`store i8 %${hiAdj}, ptr %${gpHi}`);
+  }
+
+  const ir = `define void @dequant(ptr %input, ptr %output, i32 %numBlocks) {
+entry:
+  %bid = call i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+  %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+  %bd = call i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+  %tmp = mul i32 %bid, %bd
+  %idx = add i32 %tmp, %tid
+  %cmp = icmp ult i32 %idx, %numBlocks
+  br i1 %cmp, label %process, label %exit
+
+process:
+  %offset = mul i32 %idx, 20
+  %inp = getelementptr i8, ptr %input, i32 %offset
+  %outOffset = mul i32 %idx, 32
+  %outp = getelementptr i8, ptr %output, i32 %outOffset
+${body.join("\n")}
+  br label %exit
+
+exit:
+  ret void
+}
+
+declare i32 @llvm.nvvm.read.ptx.sreg.ctaid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+declare i32 @llvm.nvvm.read.ptx.sreg.ntid.x()
+
+!0 = !{ptr @dequant, !"kernel", i32 1}
+!nvvm.annotations = !{!0}
+`;
+  return ir;
+}
+
+export class DequantKernel {
+  private _fn: bigint = 0n;
+  private _initialized = false;
+
+  load() {
+    if (this._initialized) return;
+    const cs = cuda();
+    const ptx = compileLLVM(dequantLLVM());
+    const mod = Buffer.alloc(8);
+    cs.cuModuleLoadData(mod, Buffer.from(ptx + "\0"));
+    const fn = Buffer.alloc(8);
+    cs.cuModuleGetFunction(fn, Number(mod.readBigUInt64LE(0)), Buffer.from("dequant\0"));
+    this._fn = fn.readBigUInt64LE(0);
+    if (this._fn === 0n) throw Error("dequant kernel not found in PTX");
+    this._initialized = true;
+    console.log(`  dequant: ${(ptx.match(/^\s+(ld|st|add|mul|mad|and|shr|shl|setp|cvt|mov)/gm) || []).length} PTX instrs`);
+  }
+
+  /** Launch dequant kernel (no sync — caller must sync or chain kernels) */
+  launch(input: bigint, output: bigint, numBlocks: number): void {
+    if (!this._initialized) this.load();
+    const cs = cuda();
+    const gx = Math.ceil(numBlocks / 256);
+    const slotBuf = Buffer.alloc(24);
+    slotBuf.writeBigUInt64LE(input, 0);
+    slotBuf.writeBigUInt64LE(output, 8);
+    slotBuf.writeInt32LE(numBlocks, 16);
+    const pp = Number(ptr(slotBuf));
+    const kp = Buffer.alloc(4 * 8);
+    kp.writeBigUInt64LE(BigInt(pp), 0);
+    kp.writeBigUInt64LE(BigInt(pp + 8), 8);
+    kp.writeBigUInt64LE(BigInt(pp + 16), 16);
+    kp.writeBigUInt64LE(0n, 24);
+    cs.cuLaunchKernel(Number(this._fn), gx, 1, 1, 256, 1, 1, 0, 0n, ptr(kp), null);
+  }
+
+  /** Launch + sync (convenience for standalone use) */
+  run(input: bigint, output: bigint, numBlocks: number): void {
+    this.launch(input, output, numBlocks);
+    cuda().cuCtxSynchronize();
+  }
 }
 
 export const matmul = new KernelTemplate({
