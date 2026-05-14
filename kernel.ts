@@ -416,6 +416,57 @@ export function int8MatmulTTIR(cfg: TileConfig, stride = 1024): string {
 }`;
 }
 
+/** Pure TTIR Q4_K dequant kernel: reads Q4_K blocks → writes INT8 matrix.
+ *  Uses tt.addptr for per-block offset (avoids make_tensor_ptr dynamic offset bug),
+ *  2D make_tensor_ptr with fixed offset, element-wise arith + join+reshape. */
+export function dequantTTIR(stride = 1024): string {
+  const BM = 32, BK = stride, KB = stride / 32;
+  return `module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @dequant(%Q: !tt.ptr<i8>, %A: !tt.ptr<i8>) {
+    %c0 = arith.constant 0 : i32
+    %c32 = arith.constant 32 : i32
+    %c20 = arith.constant 20 : i32
+    %cS_i32 = arith.constant ${stride} : i32
+    %cS = arith.constant ${stride} : i64
+    %c1 = arith.constant 1 : i64
+    %c640 = arith.constant 640 : i64
+    %c20i = arith.constant 20 : i64
+    %cKB = arith.constant ${KB} : i64
+    %c16 = arith.constant 16 : i64
+    %cBM = arith.constant ${BM} : i64
+    %c15 = arith.constant dense<15> : tensor<${BM}x${KB}x16xi8>
+    %c8 = arith.constant dense<8> : tensor<${BM}x${KB}x16xi8>
+    %c4 = arith.constant dense<4> : tensor<${BM}x${KB}x16xi8>
+    %px = tt.get_program_id x : i32
+
+    // Per-block offset using tt.addptr (works with multi-block)
+    %bm = arith.muli %px, %c32 : i32
+    %bm32 = arith.muli %bm, %c32 : i32
+    %blk_off = arith.muli %bm32, %c20 : i32
+    %Qp = tt.addptr %Q, %blk_off : !tt.ptr<i8>, i32
+
+    // 3D load via fixed-offset make_tensor_ptr from the offset pointer
+    %tQ = tt.make_tensor_ptr %Qp,[%cBM,%cKB,%c16],[%c640,%c20i,%c1],[%c0,%c0,%c0]{order=array<i32:2,1,0>}:!tt.ptr<tensor<${BM}x${KB}x16xi8>>
+    %q3 = tt.load %tQ:!tt.ptr<tensor<${BM}x${KB}x16xi8>>
+
+    %lo = arith.andi %q3, %c15 : tensor<${BM}x${KB}x16xi8>
+    %hs = arith.shrui %q3, %c4 : tensor<${BM}x${KB}x16xi8>
+    %hi = arith.andi %hs, %c15 : tensor<${BM}x${KB}x16xi8>
+    %lc = arith.subi %lo, %c8 : tensor<${BM}x${KB}x16xi8>
+    %hc = arith.subi %hi, %c8 : tensor<${BM}x${KB}x16xi8>
+    %jn = tt.join %lc, %hc : tensor<${BM}x${KB}x16xi8> -> tensor<${BM}x${KB}x16x2xi8>
+    %a = tt.reshape %jn : tensor<${BM}x${KB}x16x2xi8> -> tensor<${BM}x${BK}xi8>
+
+    // Store via addptr for per-block byte offset (row * stride)
+    %byte_off = arith.muli %bm, %cS_i32 : i32
+    %Ap = tt.addptr %A, %byte_off : !tt.ptr<i8>, i32
+    %tA = tt.make_tensor_ptr %Ap,[%cBM,%cS],[%cS,%c1],[%c0,%c0]{order=array<i32:1,0>}:!tt.ptr<tensor<${BM}x${BK}xi8>>
+    tt.store %tA,%a:!tt.ptr<tensor<${BM}x${BK}xi8>>
+    tt.return
+  }
+}`;
+}
+
 /** Fused Q4_K dequant + TC matmul in a single TTIR kernel — no K-loop, full BK=1024.
  *  Loads all Q4_K blocks as a 3D tensor [BM×32×16] via strided make_tensor_ptr,
  *  dequantizes element-wise, interleaves via join+reshape, single tt.dot. */
