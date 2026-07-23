@@ -597,3 +597,31 @@ fla `fla/ops/gated_delta_rule/` contains the full production set:
   as iter-arg). This is the fast prefill (the naive `gdn_*` recurrence is O(T)).
 - `fused_recurrent.py` — the optimized recurrent decode step (with gate).
 - `gate.py` — the decay-gate application.
+
+## RoPE & conv1d optimized (f16, Liger/fla-style, benchmarked at scale)
+
+Both upgraded from the first f32 cuts to **f16 in/out** (the model dtype → 2× less
+bandwidth; f32 intermediate for precision) and **benchmarked at realistic scale**.
+
+| kernel | dtype | size | throughput | % of 936 GB/s HBM peak |
+|---|---|---|---|---|
+| RoPE (Q+K, interleaved, partial 0.25) | f16 | 8192×(8+2)×256 | 616 GB/s | 66% |
+| conv1d (depthwise causal k=4 + silu) | f16 | 8×512×6144 | 725 GB/s | 77% |
+
+RoPE is lower (66%) because **interleaved rotation forces strided (stride-2) even/odd
+loads** — less coalesced than Liger's contiguous rotate_half. Qwen3.5 mandates
+`mrope_interleaved=true`, so this is an inherent cost (a contiguous-load + in-register
+pairing rewrite could recover some). conv1d at 77% is near memory-bound.
+
+### Bugs found while optimizing
+- **`buildRoPE` bakes H into the tensor shapes** (`makeTensorPtr [M·H·HD]`), so one
+  compiled kernel can't serve both Q (H=HQ) and K (H=HKV) — launching it for K with
+  grid `[M, HKV]` indexed K as if it had HQ heads → **OOB → CUDA_ERROR_ILLEGAL_ADDRESS
+  (rc 700)**. Fix: compile **two kernels** (one per H).
+- **Cross-context CUDA events**: `getCuCtx`/`createCudaEvents` from `src/kernel` use
+  kernel.ts's CUDA context, but the rope kernel is compiled on `src/ttir`'s context →
+  `CUDA_ERROR_INVALID_HANDLE (rc 400)`. Fix: use host timing on the ttir context
+  (`cuSync`), not kernel.ts events, for ttir-compiled kernels. (The FA2 autotuner
+  worked because it used kernel.ts throughout.)
+- The 0-d-tensor builder limitation (from gdn_gated) also blocks in-kernel L2-norm of
+  a single vector — use a 2-D row-wise kernel instead.
