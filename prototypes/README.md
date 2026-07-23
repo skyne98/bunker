@@ -60,3 +60,61 @@ If the `experiments/` quantized-matmul loaders ever pull many weight shards
 concurrency ~8 will peg this SSD at 7.1 GB/s — within 3% of theoretical max.
 Nothing in JS-land can go faster on this drive; only a second NVMe or
 RAM-resident data would.
+
+## gpu_upload.ts — Can we push SSD data into GPU memory at SSD-max speed?
+
+**Question:** If we read tensors from the SSD and upload them to the GPU, can the
+combined pipeline sustain the SSD's ~7 GB/s, or does the host→device copy add on
+top? Reuses the 8 × 1 GB test files from `ssd_saturate.ts`.
+
+```bash
+bun run prototypes/ssd_saturate.ts   # create the 8x1GB test files
+bun run prototypes/gpu_upload.ts
+```
+
+### The key facts
+- **PCIe upload (RAM→GPU) is ~22 GB/s** — ~3× faster than the SSD. So the copy
+  is *never* the bottleneck; the only question is whether we can **hide** the
+  ~0.4 s of copy time behind the ~1.2 s of read time.
+- **Two ingredients are both required** for the upload to be hidden:
+  1. **Chunked/streamed reads** — concurrent whole-file reads finish clustered,
+     leaving no window to overlap uploads. Reading in ~64 MB slices staggers
+     completions so async copies run throughout the read phase.
+  2. **Pinned host memory** (`cuMemHostRegister`) — otherwise
+     `cuMemcpyHtoDAsync` from unpinned Bun-allocated buffers degrades to
+     synchronous (CUDA pins-and-copies inline, blocking the JS thread).
+- Either ingredient alone caps at ~5–6 GB/s; **both together reach the SSD
+  ceiling on good runs**.
+
+### Result (8.59 GB, cold cache, RTX 3090)
+| Strategy | Time | Throughput |
+|---|---|---|
+| A. HtoD ceiling (RAM→GPU, sync) | 0.40 s | 22 GB/s |
+| B. Serial read+upload (no overlap) | 2.9 s | 3 GB/s |
+| C. Pipelined (async, unpinned) | 1.8 s | 5 GB/s |
+| D. Pinned + read-into-buf + async | 1.6 s | 5–6 GB/s |
+| E. Bun read + register-pin + async | 1.7 s | 5 GB/s |
+| F. Chunked stream (no pin) | 1.5 s | 6 GB/s |
+| **G. Chunked + pinned pipeline** | **1.25–1.75 s** | **5–7 GB/s** |
+| SSD-only ceiling (ref) | — | ~7.1 GB/s |
+
+### Findings
+1. **The upload phase is provably hidden.** Copies alone take 0.4 s (strategy A);
+   the full pipeline G takes ~1.25–1.75 s, which is dominated by the read phase
+   (8.6 GB / 7 GB/s ≈ 1.2 s). The copies fit inside the read window.
+2. **G reaches the SSD ceiling (~7 GB/s) on good runs** — i.e. data lands in GPU
+   memory as fast as the SSD can deliver it, with the PCIe upload fully overlapped.
+3. **Run-to-run variance is ±2 GB/s** (G ranges 5–7 GB/s). It comes from
+   page-cache-drop timing and NVMe read scheduling — *not* from the upload.
+   Chunked slice reads have higher per-op overhead than whole-file reads, which
+   trims the raw read rate on some runs.
+4. **Without overlap you lose ~40%.** Strategy B (serial) is 3 GB/s; even the
+   naive async C is only 5 GB/s. The double-buffered DMA pipeline (G) is what
+   closes the gap to the SSD wall.
+
+### Takeaway for bunker
+For streaming quantized weights / KV-cache tensors from disk onto the GPU, use
+the **G** pattern: read in ~64 MB slices with bounded concurrency (~8),
+`cuMemHostRegister` each slice, `cuMemcpyHtoDAsync_v2` onto a stream, and
+`cuStreamSynchronize` once at the end. That hits the SSD's max (~7 GB/s on this
+box) with the upload fully hidden. The copy is never the limit on Gen4.
