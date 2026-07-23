@@ -661,3 +661,39 @@ speedup (the whole point of chunking) needs the efficient WY + state-dim
 tiling for occupancy — the sophistication in fla's tuned triton kernels. This
 remains future work; the naive recurrence (`gdn_clean`/`gdn_gated`) is
 currently the faster correct path.
+
+## gdn_fast.ts — fla-faithful chunked GatedDeltaNet (state-tiled, WIP)
+
+Ports fla's actual chunked structure (`gated_delta_rule/chunk.py` +
+`common/chunk_h.py` + `chunk_o.py`) — state-tiled for occupancy, fixing
+gdn_chunk's two slowness causes (Neumann O(C³) WY + per-(b,h) grid = 4 programs):
+
+- **WY on the host** (efficient forward-substitution, no Neumann, no GPU
+  slicing): `A=(I−L)⁻¹`, `w=A@k_beta`, `u=A@v_beta`.
+- **State-dim tiling** (fla's pattern): `fwd_h` grid `[B·H, NV]`, `fwd_o` grid
+  `[B·H, nChunks, NV]`.
+- **Two GPU kernels** (fla's split): `fwd_h` (`v_new=u−w@h`; store `h[c]` before
+  update; `h += kᵀ@v_new`) and `fwd_o` (`o = scale·(q@h + tril(q@kᵀ)@v_new)`).
+
+### Status: runs (rc=0) but WIP — NOT yet correct, NOT yet faster
+- ✅ **runs** (both kernels rc=0; the clean rewrite fixed the crash).
+- ❌ **correctness**: mismatches the O(T) recurrence reference (~5× off) — a
+  subtle WY/convention issue remains to pin down.
+- ❌ **speed**: 3815 µs vs naive recurrence 830 µs — **slower** at this size
+  (BH=8 → only 16 fwd_h programs; the chunked form's parallelism needs large
+  batch×heads to pay off, plus the 2-kernel HBM round-trip for h/v_new).
+
+### Bugs found (builder) while porting
+- **Carrying 6 `scf.for` iter-args** (a tensor + 5 tiled pointers) crashes
+  (async trap). Fix: carry only `h` (1 iter-arg) and recompute tiled pointers
+  from the loop `iv` each iteration. (Carrying 2 worked; 6 didn't.)
+- Async kernel traps surface as a *later* `cuDtoH` failure (rc from
+  `cuLaunchKernel` is just the enqueue); check `cuSync`'s return for the real
+  error.
+- 3-D `make_tensor_ptr` loads differ from stores; prefer flat 2-D tiled
+  pointers and reshape on the host side.
+
+This remains the open GatedDeltaNet task: the fla-faithful structure is built and
+runs, but matching the O(T) reference and beating the naive recurrence needs the
+convention fix + larger batch/head counts. The naive recurrence
+(`gdn_clean`/`gdn_gated`) is still the working correct path.
