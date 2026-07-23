@@ -334,3 +334,30 @@ When `BN > BM` (K-tile wider than the Q-block), the two-stage diagonal mask /
 `tpK` advancement produces wrong output. The autotuner's correctness filter
 makes this safe (it skips those configs), but the diagonal-stage masking should
 be fixed to handle `BN > BM` (useful — wider K-tiles can be faster when correct).
+
+### Update: BN>BM bug FIXED — unlocks wider K-tiles (39.2 → 47.5 TFLOPS)
+
+The two-stage split had a real bug: stage 1 (unmasked) looped `[0, diagStart)`
+in `BN`-sized tiles, but when `BN` didn't divide `diagStart` (= `pidM·BM`,
+i.e. whenever `BN > BM`), the last stage-1 tile overshot into the diagonal
+region and treated upper-triangle entries as valid. The original Triton tutorial
+side-steps this by requiring `BM` to be a multiple of `BN`.
+
+**Fix:** align stage 1's end down to a `BN` boundary and let the masked stage 2
+cover the straddling tile:
+```ts
+const stage1End = b.mul(b.divi(diagStart, b.i32(BN)), b.i32(BN));  // floor-align
+// stage 1 (unmasked): [0, stage1End)   stage 2 (masked): [stage1End, diagEnd)
+```
+
+Result: **all 54 configs are now correct** (zero skips), and the wider K-tile
+is now both correct AND the fastest:
+
+| config | before fix | after fix |
+|---|---|---|
+| BM=32 BN=32 w=4 (square) | 39.2 ✓ | 40.3 ✓ |
+| **BM=32 BN=64 w=4 s=3** (wide K) | ~~50 TFLOPS but WRONG~~ | **47.5 TFLOPS ✓** |
+
+**Autotuned best: BM=32 BN=64 w=4 s=3 → 47.5 TFLOPS** (max err 0.0002) =
+**67% of the 3090's 71 TFLOPS f16 peak**. The bugfix lifted the honest best
+39.2 → 47.5 (1.2×) by making the faster wide-K-tile config valid.

@@ -64,6 +64,10 @@ export function buildFA2vllm(Hq: number, Hkv: number, M: number, N: number, D: n
   const kvBase = b.mul(kvHead, b.i32(N));                    // kv_head*N
   const diagStart = b.mul(pidM, b.i32(BM));                  // m·BM
   const diagEnd = b.add(diagStart, b.i32(BM));               // (m+1)·BM
+  // stage 1 (unmasked) must end on a BN boundary ≤ diagStart, else its last
+  // tile overshoots into the diagonal region and treats upper-triangle entries
+  // as valid (the bug that broke all BN>BM configs). floor-align down to BN:
+  const stage1End = b.mul(b.divi(diagStart, b.i32(BN)), b.i32(BN));
   const scale = b.f32(1 / Math.sqrt(D));
 
   const tpQ = b.makeTensorPtr(Qp, [Hq * M, D], [D, 1], [qRowOff, b.i32(0)], [BM, D], "f16", [1, 0]);
@@ -76,8 +80,8 @@ export function buildFA2vllm(Hq: number, Hkv: number, M: number, N: number, D: n
   const m0 = b.splat(b.f32(-1e30), [BM], "f32");
   const l0 = b.splat(b.f32(0), [BM], "f32");
 
-  // ── STAGE 1: off-diagonal, fully unmasked [0, diagStart) ──────────────
-  const r1 = b.forIter(b.index(0), diagStart, b.index(BN), [acc0, m0, l0, tpK0, tpV0],
+  // ── STAGE 1: off-diagonal, fully unmasked [0, stage1End) ──────────────
+  const r1 = b.forIter(b.index(0), stage1End, b.index(BN), [acc0, m0, l0, tpK0, tpV0],
     (bb, _iv, [acc, m_i, l_i, tpK, tpV]) => {
       const kt = bb.trans(bb.load(tpK));
       const v = bb.load(tpV);
@@ -85,8 +89,8 @@ export function buildFA2vllm(Hq: number, Hkv: number, M: number, N: number, D: n
       return [a, m, l, bb.advance(tpK, [bb.i32(BN), bb.i32(0)]), bb.advance(tpV, [bb.i32(BN), bb.i32(0)])];
     });
 
-  // ── STAGE 2: diagonal block [diagStart, diagEnd), masked ─────────────
-  const r2 = b.forIter(diagStart, diagEnd, b.index(BN), r1,
+  // ── STAGE 2: diagonal block [stage1End, diagEnd), masked ─────────────
+  const r2 = b.forIter(stage1End, diagEnd, b.index(BN), r1,
     (bb, iv, [acc, m_i, l_i, tpK, tpV]) => {
       const kt = bb.trans(bb.load(tpK));
       const v = bb.load(tpV);
@@ -166,8 +170,8 @@ async function main() {
 
   // benchmark
   {
-    const Hq = 8, Hkv = 2, M = 2048, N = 2048, D = 128, BM = Number(process.env.BM||32), BN = Number(process.env.BN||32);
-    const NW = Number(process.env.WARPS||4), NS = Number(process.env.STAGES||4);
+    const Hq = 8, Hkv = 2, M = 2048, N = 2048, D = 128, BM = Number(process.env.BM||32), BN = Number(process.env.BN||64);
+    const NW = Number(process.env.WARPS||4), NS = Number(process.env.STAGES||3);
     const ttir = buildFA2vllm(Hq, Hkv, M, N, D, BM, BN, NW, NS);
     const k = compileAndLoad(ttir, "fa2_vllm", NW);
     const Q = f32to16(new Float32Array(Hq * M * D).map(() => (Math.random() * 2 - 1) * 0.5));
