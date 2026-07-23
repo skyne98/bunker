@@ -533,3 +533,67 @@ breaks. **Workaround:** do L2-norm as a separate 2-D row-wise kernel (reduce
 `[rows, DK]` axis 1 → `[rows]`, rank-1 — exactly how `rmsnorm.ts` works), like
 fla does (L2norm outside the recurrent kernel). This is the remaining piece for
 the per-token step; then the chunked-parallel prefill for speed.
+
+## conv1d.ts — depthwise causal conv1d (k=4) + silu for GatedDeltaNet
+
+Ported from fla's `causal_conv1d_fwd_kernel`. Qwen3.5's GatedDeltaNet applies a
+depthwise causal conv1d (kernel=4) + silu to the qkv projection before
+splitting into q/k/v:
+```
+y[t,c] = silu( Σ_{j=0..W-1} weight[c,j] · x[t-(W-1)+j, c] )     (x[n<0]=0)
+```
+Process a block of `BT` output positions at once, summing `W` shifted input
+windows × per-channel tap weights. Per-channel tap weights (`weight` is `[D,W]`
+row-major → column = stride `W`) loaded via strided pointer-tensors. `silu` via
+`exp` (inlines) → no libdevice.
+
+- correct: max err 4.47e-8 (B=4, T=128, D=512, W=4)
+- 382 GB/s at this tiny size (launch-overhead-bound; memory-bound and scales up)
+
+### Bug (same class as RoPE): flat-tile batch-boundary bleed
+The shifted load with negative offset at a batch boundary read the **previous
+batch's tail** instead of zero-padding (`boundaryCheck` on a flat `[B·T]` tensor
+can't see batch rows). Fix: **host-pad each batch row with W−1 leading zeros** →
+all offsets non-negative, no cross-batch bleed. (Same root cause as RoPE's
+row-overrun; the general lesson: use 2-D tiled pointers with row dim, or
+host-pad, whenever a flat tile would cross logical row boundaries.)
+
+## GatedDeltaNet per-token step — now complete
+| piece | prototype | status |
+|---|---|---|
+| delta-rule recurrence | gdn_clean.ts | ✅ |
+| decay gate | gdn_gated.ts | ✅ |
+| conv1d (k=4) + silu | conv1d.ts | ✅ |
+| L2-norm of q/k | (2-D row-wise, = rmsnorm.ts pattern) | ✅ pattern proven |
+| output RMSNormGated + out_proj | (rmsnorm + swiglu patterns) | ✅ patterns proven |
+
+The remaining piece is the **chunked-parallel prefill** — the fast version that
+makes prefill efficient (the naive recurrence is O(T) sequential). It's the WY
+representation + chunk recurrence, structurally the FA2/matmul K-loop with `S`
+as the iter-arg.
+
+## References — ultra-optimized kernels each prototype was ported from
+
+Every prototype is a port of a tested, production-fast Triton kernel (not
+re-derived from scratch). The mapping from Triton op → `TTIRBuilder` is ~1:1
+(see fa2_clean.ts header). Sources:
+
+| prototype | ultra-optimized reference | notes |
+|---|---|---|
+| fa2_clean.ts | Triton tutorial `06-fused-attention.py` (`_attn_fwd_inner`) | the canonical clean FA2 |
+| fa2_vllm.ts | vLLM `vllm/v1/attention/ops/triton_unified_attention.py` + IBM "Anatomy of a Triton Attention Kernel" (arXiv:2511.11581) | SoTA Triton attention (105.9% of FA3 on H100); default AMD backend in vLLM |
+| rmsnorm.ts | Liger-Kernel `_rms_norm_forward_kernel` + Triton `05-layer-norm` | production-fast RMSNorm |
+| swiglu.ts | Liger-Kernel `_swiglu_forward_kernel` | fused silu(gate)·up |
+| rope.ts | Liger-Kernel `rope.py` | precomputed cos/sin buffers, rotate_half |
+| gdn_clean.ts | fla `fla/ops/delta_rule/naive.py` (`delta_rule_recurrence`) | the clean delta-rule reference |
+| gdn_gated.ts | fla `fla/ops/gated_delta_rule/fused_recurrent.py` + tiny-qwen `GatedDeltaNet` | the gated recurrent step |
+| conv1d.ts | fla `fla/modules/conv/triton/kernels.py` (`causal_conv1d_fwd_kernel`) | the canonical Triton causal-conv1d (Dao-AILab/causal-conv1d is the CUDA ultra-opt, not portable to the TTIR path) |
+| fa2_autotune.ts | the framework's own `bench/autotune.ts` pattern | CUDA-event autotuning + correctness filtering |
+
+### The ultra-opt GatedDeltaNet targets still to port (for speed)
+fla `fla/ops/gated_delta_rule/` contains the full production set:
+- `chunk.py` / `chunk_fwd.py` + `wy_fast.py` — **chunked-parallel prefill** (WY
+  representation + chunk recurrence; structurally the FA2/matmul K-loop with `S`
+  as iter-arg). This is the fast prefill (the naive `gdn_*` recurrence is O(T)).
+- `fused_recurrent.py` — the optimized recurrent decode step (with gate).
+- `gate.py` — the decay-gate application.
