@@ -506,3 +506,30 @@ broadcast; no dot, no libdevice.
 4. output RMSNormGated + out_proj.
 5. **chunked-parallel prefill** (the fast version: WY representation + chunk
    recurrence — structurally the FA2/matmul K-loop with iter-arg `S`).
+
+## gdn_gated.ts — GatedDeltaNet per-token step WITH the decay gate
+
+Extends `gdn_clean` with the "gated" feature that defines GatedDeltaNet: the
+per-token **decay gate** `S *= decay[t]`, where `decay[t] = exp(g[t])`,
+`g[t] = -exp(A_log)·softplus(a[t]+dt_bias)`. `decay` (and the `softplus`/`log`
+inside it) is **precomputed on the host** (exact, no libdevice — same trick as
+RoPE's cos/sin) and passed as a `[BH*T]` buffer; the kernel only multiplies. β
+stays folded on the host (`kb=k·β`, `vb=v·β`), so no per-token scalar-β in-kernel.
+
+Per token (q scaled 1/√d_k):
+```
+S = S · decay              # decay[t] loaded as [1] → expandDims → broadcast [DK,DV]
+delta = vb − (kb·S)        # reduce axis 0 → [DV]
+S += k ⊗ delta             # outer
+o = q · S                  # reduce axis 0 → [DV]
+```
+- correct: **max err 2.61e-8** vs reference (BH=4, T=64, d_k=d_v=128, decay ~0.95–0.99)
+
+### Builder limitation hit: 0-d tensors
+Reducing a 1-D vector (`sum(x, 0)` on `[DK]`) or `reshape` to `[]` produces a
+0-d tensor, but the builder renders it as `f32` (scalar) instead of `tensor<f32>`
+(`typeText` treats rank-0 as scalar). So L2-norm of a single vector in-kernel
+breaks. **Workaround:** do L2-norm as a separate 2-D row-wise kernel (reduce
+`[rows, DK]` axis 1 → `[rows]`, rank-1 — exactly how `rmsnorm.ts` works), like
+fla does (L2norm outside the recurrent kernel). This is the remaining piece for
+the per-token step; then the chunked-parallel prefill for speed.
