@@ -578,9 +578,9 @@ export class TTIRBuilder {
   shl(a: Value, b: Value): Value { return this.bitwise(a, b, "shl"); }
   lshr(a: Value, b: Value): Value { return this.bitwise(a, b, "lshr"); }
   ashr(a: Value, b: Value): Value { return this.bitwise(a, b, "ashr"); }
-  and(a: Value, b: Value): Value { return this.bitwise(a, b, "and"); }
-  or(a: Value, b: Value): Value { return this.bitwise(a, b, "or"); }
-  xor(a: Value, b: Value): Value { return this.bitwise(a, b, "xor"); }
+  and(a: Value, b: Value): Value { return this.bitwise(a, b, "andi"); }
+  or(a: Value, b: Value): Value { return this.bitwise(a, b, "ori"); }
+  xor(a: Value, b: Value): Value { return this.bitwise(a, b, "xori"); }
   private bitwise(a: Value, b: Value, op: string): Value {
     if (!isInt(a.elem)) throw new Error(`${op}: requires integer, got ${a.elem}`);
     const r = this.fresh("b");
