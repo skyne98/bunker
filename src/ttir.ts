@@ -28,7 +28,7 @@ import { dlopen, ptr as ffiPtr, CString } from "bun:ffi";
 
 export type ScalarElem =
   | "i1" | "i8" | "i16" | "i32" | "i64"
-  | "f16" | "f32" | "f64";
+  | "f16" | "bf16" | "f32" | "f64";
 
 /** Element type of a tensor: a scalar, a pointer to a scalar, or a tiled pointer. */
 export type Elem =
@@ -49,7 +49,7 @@ export function isTiledPtr(e: Elem): e is { tile: { shape: number[]; elem: Scala
   return typeof e === "object" && e !== null && "tile" in (e as any);
 }
 export function isFloat(e: Elem): boolean {
-  return e === "f16" || e === "f32" || e === "f64";
+  return e === "f16" || e === "bf16" || e === "f32" || e === "f64";
 }
 export function isInt(e: Elem): boolean {
   return e === "i1" || e === "i8" || e === "i16" || e === "i32" || e === "i64";
@@ -65,7 +65,9 @@ function elemText(e: Elem): string {
 /** Render a tensor type, e.g. `tensor<128x128xf32>` or `i32` (scalar). */
 export function typeText(t: TensorType): string {
   if (t.shape.length === 0) return elemText(t.elem);
-  return `tensor<${t.shape.join("x")}x${elemText(t.elem)}>`;
+  const shapeStr = t.shape.join("x");
+  const elemStr = elemText(t.elem);
+  return `tensor<${shapeStr}x${elemStr}>`;
 }
 
 /** A typed SSA value produced by the builder. */
@@ -385,6 +387,7 @@ export class TTIRBuilder {
   f32(v: number): Value { const r = this.fresh("c"); this.emit(`%${r} = arith.constant ${floatLit(v)} : f32`); return scalar(`%${r}`, "f32"); }
   /** Scalar f16 constant. */
   f16(v: number): Value { const r = this.fresh("c"); this.emit(`%${r} = arith.constant ${floatLit(v)} : f16`); return scalar(`%${r}`, "f16"); }
+  bf16(v: number): Value { const r = this.fresh("c"); this.emit(`%${r} = arith.constant ${floatLit(v)} : bf16`); return scalar(`%${r}`, "bf16"); }
   /** Scalar i64 constant. */
   i64(v: number): Value { const r = this.fresh("c"); this.emit(`%${r} = arith.constant ${v} : i64`); return scalar(`%${r}`, "i64"); }
   /** Scalar `index`-type constant (for scf.for bounds/IV). */
@@ -405,7 +408,7 @@ export class TTIRBuilder {
   /** Dense-zero tensor of the given shape/element. */
   zeros(shape: number[], elem: ScalarElem = "f32"): Value {
     const r = this.fresh("z");
-    const zero = elem === "f16" || elem === "f32" || elem === "f64" ? "0.000000e+00" : "0";
+    const zero = isFloat(elem) ? "0.000000e+00" : "0";
     this.emit(`%${r} = arith.constant dense<${zero}> : ${typeText({ shape, elem })}`);
     return tensor(`%${r}`, shape, elem);
   }
@@ -651,12 +654,12 @@ export class TTIRBuilder {
   /** Zero-extend. */
   zext(a: Value, to: "i32" | "i64"): Value { return this.cast1(a, "zexti", to); }
   /** Signed int → float. */
-  sitofp(a: Value, to: "f16" | "f32" | "f64"): Value { return this.cast1(a, "sitofp", to); }
+  sitofp(a: Value, to: "f16" | "bf16" | "f32" | "f64"): Value { return this.cast1(a, "sitofp", to); }
   /** Float → signed int. */
   fptosi(a: Value, to: "i8" | "i16" | "i32" | "i64"): Value { return this.cast1(a, "fptosi", to); }
   /** Float → float (widening/narrowing). */
   fpext(a: Value, to: "f32" | "f64"): Value { return this.cast1(a, "extf", to); }
-  fptrunc(a: Value, to: "f16" | "f32"): Value { return this.cast1(a, "truncf", to); }
+  fptrunc(a: Value, to: "f16" | "bf16" | "f32"): Value { return this.cast1(a, "truncf", to); }
   /** Reinterpret bits. */
   bitcast(a: Value, to: ScalarElem): Value { return this.cast1(a, "bitcast", to); }
   /** Cast between `index` and integer types (needed for scf.for IV → i32 offsets). */
@@ -772,7 +775,7 @@ export class TTIRBuilder {
     const [M, K1] = a.type.shape;
     const [K2, N] = b.type.shape;
     if (K1 !== K2) throw new Error(`dot: K mismatch ${K1} vs ${K2}`);
-    const outElem: ScalarElem = (isFloat(a.elem) && a.elem === "f16") ? "f32" : (isFloat(a.elem) ? a.elem : "i32");
+    const outElem: ScalarElem = (isFloat(a.elem) && (a.elem === "f16" || a.elem === "bf16")) ? "f32" : (isFloat(a.elem) ? a.elem : "i32");
     const outShape = [M, N];
     const accVal = acc ?? this.zeros(outShape, outElem);
     const r = this.fresh("dot");
@@ -1041,7 +1044,7 @@ function parseParamElem(text: string): ScalarElem | { ptr: ScalarElem } {
   const t = text.trim();
   const m = t.match(/^ptr<(.+)>$/);
   if (m) return { ptr: m[1] as ScalarElem };
-  if (["i1","i8","i16","i32","i64","f16","f32","f64"].includes(t)) return t as ScalarElem;
+  if (["i1","i8","i16","i32","i64","f16","bf16","f32","f64"].includes(t)) return t as ScalarElem;
   throw new Error(`kernel_ttir: unknown param type '${t}'`);
 }
 
