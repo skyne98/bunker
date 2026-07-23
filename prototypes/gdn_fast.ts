@@ -45,7 +45,7 @@ function buildFwdIntra(BH: number, nC: number, C: number, DK: number, DV: number
     const bAVec = bb.sum(bARow, 0);                              // [C]  extract row i
     const contrib = bb.sum(bb.mul(bb.broadcast(bb.expandDims(bAVec, 1), [C, C]), bA), 0);  // [C]
     const newRow = bb.add(bAVec, contrib);
-    const newRowBc = bb.broadcast(bb.expandDims(newRow, 1), [C, C]);
+    const newRowBc = bb.broadcast(bb.expandDims(newRow, 0), [C, C]);
     return [bb.select(mask, newRowBc, bA)];                     // update row i, cols<i
   });
   const eye = b.select(b.eq(rowI, colI), b.splat(b.f32(1), [C, C], "f32"), zeroCC);

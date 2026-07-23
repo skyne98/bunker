@@ -40,7 +40,7 @@ function buildSolveTril64(BH: number, nC: number) {
       const baMasked = bb.select(bb.lt(o_i, i), ba, zeroVec);  // where(o_i < i, ba, 0)
       const contrib = bb.sum(bb.mul(bb.broadcast(bb.expandDims(baMasked, 1), [B16, B16]), bA), 0);
       const baNew = bb.add(baMasked, contrib);
-      const baBc = bb.broadcast(bb.expandDims(baNew, 1), [B16, B16]);
+      const baBc = bb.broadcast(bb.expandDims(baNew, 0), [B16, B16]);
       const updMask = bb.broadcast(bb.expandDims(bb.eq(o_i, i), 1), [B16, B16]);
       return [bb.select(updMask, baBc, bA)];
     });
