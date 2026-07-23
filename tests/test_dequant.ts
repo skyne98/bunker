@@ -1,5 +1,5 @@
 // test_dequant.ts — Test & benchmark on-device Q4_K dequant kernel
-import { DequantKernel } from "./kernel.ts";
+import { DequantKernel } from "../src/kernel.ts";
 
 const M = 128, BLOCK_SIZE = 32, BLOCKS_PER_ROW = 32;
 const NUM_BLOCKS = M * BLOCKS_PER_ROW;

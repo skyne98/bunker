@@ -1,5 +1,5 @@
 // Q4_K × Q8_1 matmul with struct definitions
-import { kernel, ptr, f32, i32, i8, i16, struct, array, sizeof } from "./dsl";
+import { kernel, ptr, f32, i32, i8, i16, struct, array, sizeof } from "../src/dsl";
 
 // Define block formats
 const Q8_1 = struct({

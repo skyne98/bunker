@@ -1,6 +1,6 @@
 // test_q4k_pipeline.ts — Full Q4_K×Q8_1 pipeline with CUDA event timing
 import { ptr } from "bun:ffi";
-import { DequantKernel, int8MatmulTTIR, compileTTIR, getCuCtx, createCudaEvents, gpuTimeUs } from "./kernel.ts";
+import { DequantKernel, int8MatmulTTIR, compileTTIR, getCuCtx, createCudaEvents, gpuTimeUs } from "../src/kernel.ts";
 
 const cs = getCuCtx();
 const ev = createCudaEvents();

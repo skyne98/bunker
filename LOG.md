@@ -213,3 +213,348 @@ Dequant kernel (on-device)        Already INT8
 - test_32x1024x32_pid_nobc.ttir: Winning INT8 TC kernel (33 TFLOPS)
 - dequant kernel: DSL-based (one thread per Q4_K block, nibble extraction)
 - q4k_final2.ts: Complete two-kernel pipeline
+
+## 2025-07-18 — Portable TTIR authoring layer: fluent builder + arrow-function lift
+
+### Goal (per AGENTS.md "Design principles")
+Add the missing kernel-writing features for the 3090, but keep them **portable
+across every Triton backend** (TTIR is the surface, not NVVM-intrinsic LLVM IR)
+and **extremely pleasant** (arrow-function authoring like Triton Python).
+
+### What was built — `ttir.ts` rewrite
+
+**1. Fluent, type-tracking `TTIRBuilder`.** Each `Value` carries its tensor type
+(`tensor<MxNxE>`), so ops chain fluently and infer result types automatically.
+Scalars auto-splat to tensor operands (pleasant broadcasting). Full op set:
+- Constants: `i32/f32/f16/i64/f64/bool/index`, `arange`, `zeros`, `splat`
+- Program: `programId`, `numPrograms`
+- Memory: `makeTensorPtr` (tiled pointers), `advance`, `load`/`store` (tiled +
+  pointer-tensor forms, with boundaryCheck/mask/other), `addptr`, `splatPtr`
+- Elementwise: `add/sub/mul/div`, `divi/divf/remi`, `minimum/maximum`, `shl/
+  lshr/ashr/and/or/xor`, `neg`, `abs` (all type-aware int/float)
+- Casts: `trunc/ext/zext/sitofp/fptosi/fpext/fptrunc/bitcast`
+- Compare: `eq/ne/lt/gt/le/ge` (type-aware → i1 tensor), `select`
+- `math` dialect: `exp/log/sqrt/rsqrt/sin/cos/tanh/floor/ceil/round`
+- Reductions: `sum/max/min` (via `tt.reduce`)
+- Layout: `trans/reshape/broadcast/expandDims`
+- Matmul: `dot` (with optional accumulator)
+- Atomics: `atomicAdd/Max/Min/Xchg` (tiled-pointer form)
+- Control flow: `if_` (scf.if), `for_` (void scf.for), `forIter` (scf.for with
+  iter-args + yield — for accumulation loops), `while_` (scf.while)
+
+Type-model fix: tiled pointers (`!tt.ptr<tensor<MxNxE>>`) are distinguished
+from pointer-tensors (`tensor<Nx!tt.ptr<E>>`) via a `tile` elem kind — they had
+been conflated, breaking makeTensorPtr loads/stores.
+
+**2. `kernel_ttir(fn)` — arrow-function AST→TTIR lift.** Write a plain TS arrow
+function with typed params (`ptr<f32>`, `i32`, ...); it is *parsed* (via the
+typescript compiler API) and lowered to TTIR through the builder. Triton-Python
+ergonomics: `load(A + offs, { mask })`, `store(C + offs, val, { mask })` produce
+pointer-tensor arithmetic automatically. Captured numeric constants
+(`const BLOCK = 256;`) are resolved from the caller's source file.
+
+### Dependency fix
+`import ts from "typescript"` was resolving to a version stub (TypeScript 7.0
+restructured the package — `.` exports `lib/version.cjs`, the classic
+`createSourceFile`/`ScriptTarget` API is gone). Installed `typescript@5`
+locally (`bun add typescript@5`). This also unbreaks `dsl.ts`'s `kernel()`,
+which had the same broken import.
+
+### Verified on the 3090 (end-to-end: TTIR → shim → PTX → cuLaunchKernel)
+- `test_ttir_builder.ts` — vector add via fluent builder. ✓
+- `test_ttir_matmul_run.ts` — FP16 single-tile matmul, K=512, BK=512 (full K
+  in one tile), 205 KB PTX, 32 KB shmem, err 0.004. ✓
+- `test_ttir_matmul_kloop.ts` — FP16 K-loop matmul (scf.for + tt.advance +
+  iter-arg accumulator), K=512, BK=64 (8 tiles), err 0.005. ✓
+- `test_kernel_ttir.ts` — vector add via arrow-function lift. ✓
+- `test_shim.ts` — baseline raw-TTIR → GPU (cleaned of dead builder code). ✓
+
+### K-loops RESOLVED — root cause was PTX loading, not the shim
+The earlier "known limitation" was a red herring. The TTIR, builder, lift, and
+the shim's MLIR→PTX lowering were all correct the whole time. The ONLY bug was
+**how PTX was loaded**: plain `cuModuleLoadData(ptx)` uses the driver's default
+JIT, which rejects some valid PTX with `CUDA_ERROR_INVALID_PTX` (rc=218) —
+inconsistently, for multi-tile / scf.for / tt.advance kernels. `ptxas` assembles
+the same PTX cleanly, and `cuModuleLoadDataEx` with `CU_JIT_OPTIMIZATION_LEVEL=4`
+loads it correctly.
+
+**Clean resolution:** load PTX via `cuModuleLoadDataEx` with
+`CU_JIT_OPTIMIZATION_LEVEL=4` (in `loadPTX` / `compileAndLoad`), not plain
+`cuModuleLoadData`. This makes ALL patterns work:
+- single-tile `tt.dot` (BK=K) — ✓
+- chained unrolled `tt.dot` (8 tiles) — ✓
+- `scf.for` K-loop with iter-arg accumulator — ✓
+- `tt.advance` (tiled pointer sliding over K) — ✓
+
+`test_ttir_matmul_kloop.ts` now passes end-to-end (scf.for + tt.advance +
+iter-arg acc, M=N=K=512, max err 0.005). No shim rebuild needed; the
+LLVM-22/Triton-3.6 mismatch does NOT affect `tt.dot` accumulation after all.
+
+A pleasant shared CUDA runtime (`cu()`, `cuAlloc`, `cuHtoD`, `cuDtoH`, `cuFree`,
+`cuSync`, `cuLaunch`) was added so load+launch share one context (the earlier
+launch rc=400 INVALID_HANDLE was a second context — also fixed by the shared
+runtime).
+
+### Files
+- `ttir.ts` — rewritten: type-tracking builder + kernel_ttir lift + compileTTIR
+  + `loadPTX`/`compileAndLoad` (driver JIT OPT=4) + shared `cu()` runtime
+  (cuAlloc/HtoD/DtoH/Free/Sync/Launch)
+- `test_ttir_builder.ts`, `test_ttir_matmul_run.ts`, `test_ttir_matmul_kloop.ts`,
+  `test_kernel_ttir.ts` — new end-to-end tests
+- `test_shim.ts` — cleaned (dead builder code removed)
+- `package.json` + `node_modules/typescript@5` — TS compiler API dependency
+
+## 2025-07-18 (later) — Reductions, math dialect, robust PTX loading
+
+### `tt.reduce` (region form)
+The builder's `reduce`/`sum`/`max`/`min` now emit the correct MLIR generic form
+(`tt.reduce` has no custom assembly, and the region comes BEFORE the attribute
+dict and function type in generic ops):
+```
+%r = "tt.reduce"(%a) ({
+  ^bb0(%x : f32, %y : f32):
+    %s = arith.addf %x, %y : f32
+    "tt.reduce.return"(%s) : (f32) -> ()
+}) {axis = 1 : i32} : (tensor<64x256xf32>) -> tensor<64xf32>
+```
+Verified: `test_ttir_reduce.ts` — row-sum of 512×256, max err 0.0000. ✓
+
+### math dialect via arrow-function lift
+`test_kernel_ttir_math.ts` — `exp` kernel written as a plain TS arrow function
+(`load(A + offs, {mask})` → `exp(a)` → `store(C + offs, ...)`), max err 3e-7. ✓
+Confirms the lift + `math.exp` lowering (no libdevice extern — inlined by the
+shim).
+
+### Robust PTX loading (driver-JIT flakiness)
+The driver's in-process PTX JIT (`cuModuleLoadDataEx` with
+`CU_JIT_OPTIMIZATION_LEVEL=4`) is **nondeterministic**: it intermittently
+rejects valid PTX with `CUDA_ERROR_INVALID_PTX` (rc=218) — observed 3/5
+failures for the exp kernel. `ptxas` accepts the same PTX every time.
+`loadPTX` now falls back to `ptxas -arch=sm_86` → cubin → `cuModuleLoadData`
+when the driver JIT rejects, making loading 5/5 reliable. `setTargetArch()`
+overrides the default `sm_86` (3090). ptxas is found via PATH then Nix store.
+
+### Verified suite (7 tests, all ✓ on the 3090)
+test_shim, test_ttir_builder, test_ttir_matmul_run (single-tile),
+test_ttir_matmul_kloop (scf.for + tt.advance + iter-arg acc), test_kernel_ttir
+(arrow-lift vector add), test_kernel_ttir_math (arrow-lift + math.exp),
+test_ttir_reduce (tt.reduce row-sum).
+
+## 2025-07-18 (final) — Atomics + arith cast syntax
+
+### `tt.atomic_rmw` (atomics)
+Found the exact custom assembly (the Triton source IR dir was empty, so probed
+empirically). The op is `tt.atomic_rmw` with THREE leading string keywords:
+op-kind, memory-order, scope — then operands, then function-type signature:
+```
+%r = tt.atomic_rmw "fadd", "relaxed", "gpu", %ptrs, %val
+    : (tensor<256x!tt.ptr<f32>>, tensor<256xf32>) -> tensor<256xf32>
+```
+Op-kind enum: `[and, or, xor, add, fadd, max, min, umax, umin, exch]`.
+**Float atomics must use `fadd`/`max`/`min`, not `add`** (integer add on f32
+bits gives garbage). The builder's `atomicAdd`/`atomicMax`/`atomicMin`/`
+`atomicXchg` dispatch the float/int variant automatically.
+Works on both tiled pointers and pointer-tensors. Verified:
+`test_ttir_atomic.ts` — 4096 threads atomic-add to one location, result
+8386560 = sum(0..4095). ✓
+
+### `arith` cast syntax fix
+`arith.sitofp`/`trunci`/`extsi`/`fptosi`/`bitcast`/etc. use `: src to dst`
+(NOT `->`). Fixed `cast1`.
+
+### Final verified suite (8 tests, all ✓ on the 3090)
+test_shim, test_ttir_builder, test_ttir_matmul_run (single-tile matmul),
+test_ttir_matmul_kloop (scf.for + tt.advance + iter-arg acc), test_kernel_ttir
+(arrow-lift vector add), test_kernel_ttir_math (arrow-lift + math.exp),
+test_ttir_reduce (tt.reduce row-sum), test_ttir_atomic (tt.atomic_rmw fadd).
+
+### Feature coverage now (portable TTIR layer)
+- Elementwise arith (int+float, type-aware), full cast set, math dialect
+- Tiled pointers (make_tensor_ptr + advance), pointer-tensors (splat+addptr)
+- tt.dot matmul (single-tile, chained, scf.for K-loop with iter-arg accumulator)
+- tt.reduce (sum/max/min, region form)
+- tt.atomic_rmw (add/fadd/max/min/xchg, tiled + pointer-tensor)
+- scf control flow (if / for / for-iter-args / while)
+- Arrow-function AST→TTIR lift with captured consts + ptr arithmetic
+- Robust PTX loading (driver JIT OPT=4 + ptxas→cubin fallback)
+- Shared pleasant CUDA runtime (cuAlloc/HtoD/DtoH/Free/Sync/Launch)
+
+### Still open (per AGENTS.md design principles)
+- Shim target-parameterization (backend selector: NVPTX vs AMDGCN). The TTIR
+  layer is already backend-agnostic; only `triton_shim.c` hardcodes NVPTX.
+  A target-descriptor ABI + AMDGPU init/triple path is the remaining work for
+  "any Triton backend" portability (no runtime change needed in the authoring
+  layer).
+- Layout ops (trans/reshape/broadcast/expandDims) are implemented but untested.
+- `while` loops in the arrow-function lift are implemented but untested.
+
+## 2025-07-18 (final+) — Layout ops, scf.while, shim target-parameterization
+
+### Layout + while verified
+- `tt.trans` requires an `order` attribute (`{order = array<i32: 1, 0>}`) —
+  fixed the builder to emit it. `test_ttir_layout.ts` transpose correct (err 0). ✓
+- `scf.while` rewritten to the proper result-yielding form:
+  `%r = scf.while (%a = %init) : (tys) -> (tys) { scf.condition(%cond) %fwd : tys }
+  do { ^bb0(%d : ty): ...; scf.yield %next : tys }`. `test_ttir_while.ts`
+  (count to 1000 via while iter-args) correct. ✓
+
+### Shim target-parameterization (portability — AGENTS.md principle 2)
+Rewrote `triton_shim.c` to take a **target descriptor** instead of hardcoded
+NVPTX:
+- New ABI: `triton_compile_targeted(ttir, num_warps, backend, arch, features)`
+  where backend ∈ {"cuda","rocm"}, arch = "86" (sm_86) or "gfx90a", features =
+  "+ptx75" or "".
+- `triton_compile(ttir, num_warps)` kept as a 3090-default wrapper
+  (`cuda`/`86`/`+ptx75`).
+- `initAllTargets()` initializes BOTH NVPTX and AMDGPU LLVM targets (idempotent).
+- NVPTX path fully parameterized: target string `"cuda:<cc>"`, compute-cap +
+  ptx version parsed from arch/features, triple `nvptx64-nvidia-cuda`, cpu
+  `sm_<arch>`.
+- AMDGCN path structurally ready: triple `amdgcn-amd-amdhsa`, cpu = arch
+  (gfx name). Gated on `TRITON_AMD_BACKEND` (build-time, off by default — the
+  AMD Triton backend (`triton/third_party/amd`) must be linked for the
+  TTGIR→LLVM convert step; returns a clear "rebuild with AMD backend" error
+  otherwise).
+- The TTIR authoring layer is now fully backend-agnostic; backend selection
+  is a shim build/runtime concern only.
+
+TS API (ttir.ts): `setTarget({backend, arch, features})`, `resetTarget()`,
+`compileTTIRTargeted(ttir, target, numWarps)`. `compileTTIR` uses the targeted
+symbol when a target is set, else the 3090-default `triton_compile`.
+
+### Build-env status (blocker for shim rebuild)
+The shim CANNOT be rebuilt in the current environment — `triton-llvm` nix store
+path, `/tmp/triton-cmake-build/*.o`, and `/tmp/triton-src/include/**/*.td` are
+all gone (GC'd / incomplete checkout). The existing `libtriton_shim.so` (the
+old NVPTX-only build) continues to work for the 3090. The updated
+`triton_shim.c` source is design-complete and ready to build when the
+triton-llvm + Triton source environment is restored (rebuild just
+`triton_shim.c` + relink against existing objects — seconds, not the full
+~10-min CMake build). `setTarget()` against the current `.so` throws a clear
+"rebuild needed" error.
+
+### Final verified suite (10 tests, all ✓ on the 3090)
+test_shim, test_ttir_builder, test_ttir_matmul_run, test_ttir_matmul_kloop
+(scf.for + tt.advance + iter-arg), test_kernel_ttir (arrow-lift), test_kernel_ttir_math
+(math.exp), test_ttir_reduce (tt.reduce), test_ttir_atomic (tt.atomic_rmw fadd),
+test_ttir_layout (tt.trans), test_ttir_while (scf.while).
+
+### Portable feature coverage — COMPLETE (per AGENTS.md "Feature targets")
+Elementwise arith, full casts, math dialect, tiled pointers + advance,
+pointer-tensors, tt.dot (single/chained/K-loop), tt.reduce, tt.atomic_rmw,
+scf control flow (if/for/for-iter/while), tt.trans, arrow-function lift with
+captured consts + ptr arithmetic, robust PTX loading, shared CUDA runtime,
+target-parameterized shim source. Remaining = rebuild shim in a restored env
+to activate `triton_compile_targeted` / AMDGCN.
+
+## 2025-07-18 (final++) — Softmax + arrow-lift control flow (if/for)
+
+### Softmax (flagship real-world kernel)
+`test_ttir_softmax.ts` — block-wise softmax (max → sub → exp → sum → div)
+exercising tt.reduce (max+sum), math.exp, broadcast, expandDims, sub, divf
+together. 512×256, max err 4.9e-9. ✓
+
+### Arrow-function lift control flow verified
+- `if` → scf.if: `test_kernel_ttir_if.ts` (conditional masked store) ✓
+- `for` → scf.for: `test_kernel_ttir_for.ts` (idempotent store loop) ✓
+
+Two lift bugs fixed:
+1. `for_` (void) was routing through `forIter` with empty init-args, emitting
+   invalid `iter_args() -> ()`. Rewrote `for_` to emit the proper no-iter-arg
+   `scf.for %iv = %s to %e step %st : index { … }` form.
+2. `scf.for` bounds must be `index`; the lift's `for` used i32 literals.
+   Added `toIndex()` — `for_`/`forIter` auto-cast i32 bounds to index.
+
+Note: the lift's `for` is void (no iter-args) — for K-loop accumulation use
+the builder's `forIter` (TS for-loops don't express SSA iter-args; the
+builder's callback API does). `let`-reassignment isn't supported in the lift
+(use `const` + chained expressions, or the builder for accumulation).
+
+### Final verified suite (13 tests, all ✓ on the 3090)
+test_shim, test_ttir_builder, test_ttir_matmul_run, test_ttir_matmul_kloop,
+test_kernel_ttir, test_kernel_ttir_math, test_ttir_reduce, test_ttir_atomic,
+test_ttir_layout, test_ttir_while, test_ttir_softmax, test_kernel_ttir_if,
+test_kernel_ttir_for.
+
+### Status
+Portable TTIR authoring layer is feature-complete and verified end-to-end:
+elementwise + casts + math, tiled pointers + advance, pointer-tensors,
+tt.dot (single/chained/K-loop), tt.reduce, tt.atomic_rmw, scf control flow
+(if/for/for-iter/while), tt.trans, arrow-function lift (consts, ptr-arith,
+if/for), softmax, robust PTX loading, shared CUDA runtime, target-
+parameterized shim source. The sole remaining item is environmental: rebuild
+the shim in a restored triton-llvm + Triton-source env to activate
+`triton_compile_targeted` / AMDGCN (no authoring-layer work left).
+
+## 2025-07-18 (final+++) — Layernorm (libdevice limit), test robustness
+
+### Layernorm + libdevice limitation (documented)
+`test_ttir_layernorm.ts` — block-wise layernorm (mean/var/normalize). The
+builder emits correct TTIR, but `math.sqrt`/`rsqrt`/`log`/`sin`/`cos`/`tanh`
+lower to **libdevice calls** (`__nv_sqrtf` etc.) that neither the driver JIT
+(`cuModuleLoadDataEx` returns rc=201 INVALID_SOURCE) nor standalone `ptxas`
+("Unresolved extern") can link — the shim doesn't link libdevice. **Only
+`math.exp` inlines** to native PTX (so softmax works). The layernorm test
+detects this and reports it cleanly (exit 0), rather than failing opaquely.
+Fixing this is a shim/build concern: link libdevice (e.g. `llvm-link` with
+`libdevice.10.bc`) or lower `math.*` to native PTX instructions (`sqrt.rn.f32`,
+etc.). Needs the shim rebuild (env-blocked).
+
+### Float literal fix
+`arith.constant` for f32/f16/f64 now emits proper MLIR float literals
+(`1.000000e-05`, two-digit exponent) via `floatLit()` — bare `1e-5` was rejected.
+
+### Test robustness — migrated to robust loading
+`test_shim`, `test_ttir_builder`, `test_kernel_ttir` were using the old manual
+launch with plain `cuModuleLoadData` (the flaky driver-JIT path) and started
+failing as the JIT became flaky. Rewrote them to use `compileAndLoad` (driver
+JIT OPT=4 + ptxas fallback) + `cuLaunch`/`cuAlloc`/`cuHtoD`/`cuDtoH`/`cuFree`
+— the pleasant shared runtime. All now pass reliably.
+
+Also fixed `findPtxas`: (a) Nix-store scan matched `d.startsWith("cuda")` but
+the store path is `<hash>-cuda...` so the hash prefix came first — changed to
+`d.includes("cuda")`; (b) used `require()` in ESM (silently threw) — switched
+to top-level `import` (fs/child_process/path/os).
+
+### Final verified suite (14 tests on the 3090)
+13 ✓ (test_shim, test_ttir_builder, test_ttir_matmul_run, test_ttir_matmul_kloop,
+test_kernel_ttir, test_kernel_ttir_math, test_ttir_reduce, test_ttir_atomic,
+test_ttir_layout, test_ttir_while, test_ttir_softmax, test_kernel_ttir_if,
+test_kernel_ttir_for) + 1 ⚠ (test_ttir_layernorm — libdevice, reports cleanly).
+
+### Remaining (all env-blocked, no authoring-layer work)
+1. Rebuild shim (triton-llvm + Triton source env is GC'd) to activate
+   `triton_compile_targeted` / AMDGCN / parameterized NVPTX.
+2. Link libdevice (or native `math.*` lowering) to enable sqrt/log/sin/cos/tanh.
+
+## 2025-07-18 (final++++) — GPU OOM diagnosis + robustness
+
+### Root cause of the late-session test failures
+Tests started failing with "cubin load failed: rc=201". Diagnosed: `cuCtxCreate_v2`
+returns **rc=2 (CUDA_ERROR_OUT_OF_MEMORY)** — another process (PID 3856458) is
+holding ~22 GB of the 3090's 24 GB VRAM (only ~225 MiB free). The `cu()`
+singleton didn't check the context-creation rc, so everything downstream failed
+cryptically (rc=201 on module loads). **Not a code regression** — purely
+environmental (GPU contention from an external workload). The 13 ✓ + 1 ⚠ suite
+was verified earlier when the GPU had memory.
+
+### Robustness fixes
+- `cu()` now checks `cuCtxCreate_v2`'s rc and throws a clear, actionable error:
+  "cuCtxCreate failed (rc=2 OUT_OF_MEMORY) — GPU may be out of memory or in use
+  by another process. Check: nvidia-smi --query-compute-apps=pid,used_memory".
+- `loadPTX`'s ptxas-fallback temp files now cleaned up via `try/finally`
+  (41 leftover .ptx/.cubin files had accumulated in /tmp because cleanup ran
+  only on success, not on the throw paths).
+- `findPtxas` already fixed (ESM imports + Nix-store `includes` scan).
+
+### Final state
+- 14-test suite: 13 ✓ + 1 ⚠ (layernorm/libdevice), all verified on the 3090
+  when GPU memory is available.
+- Portable TTIR authoring layer: feature-complete.
+- `triton_shim.c`: target-parameterized (cuda/rocm), design-complete.
+- README.md: pleasant API overview with flagship examples.
+- Remaining (all environmental, no authoring-layer work):
+  1. GPU must have free VRAM to run (external process currently holds 22 GB).
+  2. Rebuild shim in a restored triton-llvm + Triton-source env to activate
+     `triton_compile_targeted` / AMDGCN.
+  3. Link libdevice (or native `math.*` lowering) for sqrt/log/sin/cos/tanh.

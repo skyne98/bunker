@@ -1,5 +1,5 @@
 import { ptr } from "bun:ffi";
-import { compileTTIR, getCuCtx, createCudaEvents } from "./kernel.ts";
+import { compileTTIR, getCuCtx, createCudaEvents } from "../src/kernel.ts";
 import { readFileSync } from "fs";
 
 const cs = getCuCtx();

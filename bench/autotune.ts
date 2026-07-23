@@ -1,6 +1,6 @@
 // autotune.ts — CUDA-event-based autotuner for INT8 TC matmul
 import { dlopen, ptr } from "bun:ffi";
-import { int8MatmulTTIR, compileTTIR } from "./kernel.ts";
+import { int8MatmulTTIR, compileTTIR } from "../src/kernel.ts";
 
 // Search space for INT8 TC matmul
 const SEARCH = [

@@ -9,7 +9,7 @@ function compileTTIR(ttir: string, numWarps: number): { ptx: string; shmem: numb
   const f = join(tmpdir(), `k_${process.pid}_${Math.random().toString(36).slice(2)}.mlir`);
   writeFileSync(f, ttir);
   const out = execSync(`/tmp/triton_wrap ${f} ${numWarps}`, {
-    cwd: "/home/fox/Experiments/bun-cuda", encoding: "utf-8", maxBuffer: 50 * 1024 * 1024,
+    cwd: __dirname, encoding: "utf-8", maxBuffer: 50 * 1024 * 1024,
     env: { ...process.env, LD_LIBRARY_PATH: "/nix/store/ixhlv41i2wpl84xgjcks061dz4yssbg3-zlib-1.3.2/lib:/nix/store/bfwqrbwqpbnsdbgf86gz8pn8vvddci3i-libxml2-2.13.8/lib" }
   });
   if (out.startsWith("ERROR:") || out.startsWith("loc(")) throw Error(out.substring(0, 500));

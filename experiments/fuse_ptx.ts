@@ -4,7 +4,7 @@
 // The shared memory layout, PRMT packing, and mma.sync stay unchanged.
 
 import { readFileSync, writeFileSync } from "fs";
-import { int8MatmulTTIR, compileTTIR } from "./kernel.ts";
+import { int8MatmulTTIR, compileTTIR } from "../src/kernel.ts";
 
 // Compile the TTIR INT8 kernel
 const cfg = { BM: 32, BN: 32, BK: 1024, numWarps: 4 };

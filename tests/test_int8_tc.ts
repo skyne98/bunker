@@ -1,6 +1,6 @@
 // test_int8_tc.ts — Test freshly compiled INT8 TC matmul kernel
 import { dlopen, ptr } from "bun:ffi";
-import { int8MatmulTTIR, compileTTIR } from "./kernel.ts";
+import { int8MatmulTTIR, compileTTIR } from "../src/kernel.ts";
 
 const cs = dlopen("/run/opengl-driver/lib/libcuda.so", {
   cuInit:{args:["u32"],returns:"i32"},cuDeviceGet:{args:["ptr","i32"],returns:"i32"},

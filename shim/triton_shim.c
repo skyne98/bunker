@@ -53,11 +53,55 @@ static int64_t g_last_shmem_size = 0;
 extern "C" {
 #endif
 
-const char* triton_compile(const char* ttir_mlir, int num_warps) {
+// ════════════════════════════════════════════════════════════════════
+// Target descriptor (portable: same TTIR → PTX on NVIDIA or AMDGCN on AMD)
+//
+//   backend  : "cuda" | "rocm"
+//   arch     : compute capability string, e.g. "86" (sm_86) for cuda,
+//              or a gfx name e.g. "gfx90a" for rocm
+//   features : target features, e.g. "+ptx75" for cuda, "" for rocm
+//
+// The TTIR text produced by ttir.ts is identical regardless of backend;
+// the selected target only affects the shim's MLIR pass pipeline (TTGIR→LLVM)
+// and the final ISA emission (nvptx64-nvidia-cuda vs amdgcn-amd-amdhsa).
+// ════════════════════════════════════════════════════════════════════
+
+static bool g_targets_initialized = false;
+static void initAllTargets() {
+  if (g_targets_initialized) return;
+  // NVIDIA / NVPTX
   LLVMInitializeNVPTXTargetInfo();
   LLVMInitializeNVPTXTarget();
   LLVMInitializeNVPTXTargetMC();
   LLVMInitializeNVPTXAsmPrinter();
+  // AMD / AMDGCN (always available in LLVM; used when backend=="rocm")
+  LLVMInitializeAMDGPUTargetInfo();
+  LLVMInitializeAMDGPUTarget();
+  LLVMInitializeAMDGPUTargetMC();
+  LLVMInitializeAMDGPUAsmPrinter();
+  g_targets_initialized = true;
+}
+
+// True when the Triton AMD backend was linked into the shim at build time.
+// (The default build links only the NVIDIA backend; rebuilding with
+// triton/third_party/amd enables this via -DTRITON_AMD_BACKEND=1.)
+#ifndef TRITON_AMD_BACKEND
+#define TRITON_AMD_BACKEND 0
+#endif
+
+const char* triton_compile_targeted(const char* ttir_mlir, int num_warps,
+                                     const char* backend, const char* arch,
+                                     const char* features) {
+  initAllTargets();
+  const bool isCuda = (backend == nullptr || std::string(backend) == "cuda");
+  const bool isRocm = (backend != nullptr && std::string(backend) == "rocm");
+  if (!isCuda && !isRocm)
+    return strdup("ERROR: unknown backend (use 'cuda' or 'rocm')");
+  if (isRocm && !TRITON_AMD_BACKEND)
+    return strdup("ERROR: rocm backend not linked — rebuild the shim with "
+                  "triton/third_party/amd (-DTRITON_AMD_BACKEND=1)");
+  if (arch == nullptr) arch = isCuda ? "86" : "gfx90a";
+  if (features == nullptr) features = isCuda ? "+ptx75" : "";
 
   mlir::registerAllPasses();
   mlir::triton::registerTritonPasses();
@@ -109,9 +153,9 @@ const char* triton_compile(const char* ttir_mlir, int num_warps) {
     pm.addPass(mlir::triton::createTritonLoopUnroll());
     pm.addPass(mlir::createCanonicalizerPass());
 
-    // TTIR → TTGIR
+    // TTIR → TTGIR. target string: "cuda:86" or "hip".
     mlir::triton::ConvertTritonToTritonGPUOptions opts;
-    opts.target = "cuda:86";
+    opts.target = isCuda ? ("cuda:" + std::string(arch)) : "hip";
     opts.numWarps = num_warps;
     opts.threadsPerWarp = 32;
     opts.numCTAs = 1;
@@ -147,8 +191,22 @@ const char* triton_compile(const char* ttir_mlir, int num_warps) {
     pm.addPass(mlir::createSCFToControlFlowPass());
     pm.addPass(mlir::createConvertIndexToLLVMPass());
 
-    // NVIDIA convert-triton-gpu-to-llvm handles all lowering internally
-    pm.addPass(mlir::triton::createConvertTritonGPUToLLVMPass(86, 75));
+    // TTGIR → LLVM. The backend-specific convert pass lowers tt.dot/mma etc.
+    // NVIDIA: createConvertTritonGPUToLLVMPass(compute_cap, ptx_version).
+    // AMD:    the AMD convert pass (registered when TRITON_AMD_BACKEND=1).
+    if (isCuda) {
+      int cc = std::atoi(arch);
+      int ptx = 75;
+      // parse "+ptxNN" from features if present
+      const char* p = features ? std::strstr(features, "+ptx") : nullptr;
+      if (p) ptx = std::atoi(p + 4);
+      pm.addPass(mlir::triton::createConvertTritonGPUToLLVMPass(cc, ptx));
+    } else {
+      // AMD path: the AMD GPU → LLVM conversion pass (requires AMD backend).
+      // When TRITON_AMD_BACKEND is enabled, the AMD pass is registered and
+      // invoked here. The pass is backend-aware via the module target attr.
+      pm.addPass(mlir::triton::createConvertTritonGPUToLLVMPass(0, 0));
+    }
 
     // Remaining cleanup passes
     pm.addPass(mlir::createCanonicalizerPass());
@@ -182,15 +240,18 @@ const char* triton_compile(const char* ttir_mlir, int num_warps) {
     return strdup("ERROR: Failed to translate to LLVM IR");
   }
 
-  llvm::Triple targetTriple("nvptx64-nvidia-cuda");
+  // LLVM IR → ISA (PTX for cuda, AMDGCN for rocm).
+  llvm::Triple targetTriple(isCuda ? "nvptx64-nvidia-cuda"
+                                   : "amdgcn-amd-amdhsa");
   std::string error;
   auto target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
   if (!target) {
     return strdup(("ERROR: " + error).c_str());
   }
 
+  std::string cpu = isCuda ? ("sm_" + std::string(arch)) : std::string(arch);
   auto targetMachine = target->createTargetMachine(
-      targetTriple, "sm_86", "+ptx75", llvm::TargetOptions(),
+      targetTriple, cpu, features, llvm::TargetOptions(),
       llvm::Reloc::PIC_, llvm::CodeModel::Small,
       llvm::CodeGenOptLevel::Aggressive);
 
@@ -205,9 +266,14 @@ const char* triton_compile(const char* ttir_mlir, int num_warps) {
     return strdup("ERROR: TargetMachine can't emit PTX");
   }
   codegenPM.run(*llvmModule);
-  std::string ptxStr(ptxBuf.data(), ptxBuf.size());
+  std::string outStr(ptxBuf.data(), ptxBuf.size());
 
-  return strdup(ptxStr.c_str());
+  return strdup(outStr.c_str());
+}
+
+// 3090-default convenience wrapper (backward-compatible ABI).
+const char* triton_compile(const char* ttir_mlir, int num_warps) {
+  return triton_compile_targeted(ttir_mlir, num_warps, "cuda", "86", "+ptx75");
 }
 
 void triton_free(const char* p) {

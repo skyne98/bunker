@@ -1,5 +1,5 @@
 import { dlopen, ptr as ffiPtr, CString } from "bun:ffi";
-import { kernel, ptr, f32, i32, i8 } from "./dsl";
+import { kernel, ptr, f32, i32, i8 } from "../src/dsl";
 
 // ─── v1: naive INT8 ──────────────────────────────────────────────
 const v1 = kernel((A: ptr<i8>, B: ptr<i8>, C: ptr<i32>, M: i32, N: i32, K: i32) => {

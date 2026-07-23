@@ -1,7 +1,7 @@
 // tc_gemm.ts — Tensor Core INT8 matmul via DSL asm() + LLVM 19
 // Uses mma.sync.aligned.m16n8k32 for 16x8 output tiles per warp
 import { dlopen, ptr as ffiPtr, CString } from "bun:ffi";
-import { kernel, ptr, i32, i8, f32, shared, asm, __syncthreads, memcpy, sizeof } from "./dsl";
+import { kernel, ptr, i32, i8, f32, shared, asm, __syncthreads, memcpy, sizeof } from "../src/dsl";
 
 const LLVM = "/nix/store/6r234y6pkbyyr8pk1wh7nfsmnzdxyswx-llvm-19.1.7-lib/lib/libLLVM-19.so";
 const CUDA = "/run/opengl-driver/lib/libcuda.so";

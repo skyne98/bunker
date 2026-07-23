@@ -1,6 +1,6 @@
 // test_fused_ttir.ts — Test fused TTIR kernel end-to-end
 import { ptr } from "bun:ffi";
-import { fusedDequantMatmulTTIR, compileTTIR, getCuCtx, createCudaEvents, gpuTimeUs } from "./kernel.ts";
+import { fusedDequantMatmulTTIR, compileTTIR, getCuCtx, createCudaEvents, gpuTimeUs } from "../src/kernel.ts";
 
 const cs = getCuCtx();
 const ev = createCudaEvents();

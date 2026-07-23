@@ -1,6 +1,6 @@
 // test_graph.ts — CUDA Graphs for dequant→TC pipeline, eliminating launch overhead
 import { dlopen, ptr } from "bun:ffi";
-import { DequantKernel, int8MatmulTTIR, compileTTIR, getCuCtx } from "./kernel.ts";
+import { DequantKernel, int8MatmulTTIR, compileTTIR, getCuCtx } from "../src/kernel.ts";
 
 // Use SHARED context from kernel.ts to avoid dual-context bugs
 const cs = getCuCtx();

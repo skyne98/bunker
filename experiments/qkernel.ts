@@ -1,7 +1,7 @@
 // qkernel.ts — Tensor-core accelerated Q4_K × Q8_1 matmul
 // Uses INT8 mma.sync via asm() inline PTX
 import { dlopen, ptr, CString } from "bun:ffi";
-import { kernel, ptr, f32, i32, i8, u32, asm, shared, __syncthreads, memcpy } from "./dsl";
+import { kernel, ptr, f32, i32, i8, u32, asm, shared, __syncthreads, memcpy } from "../src/dsl";
 
 const CUDA = "/run/opengl-driver/lib/libcuda.so";
 const LLVM = "/nix/store/6r234y6pkbyyr8pk1wh7nfsmnzdxyswx-llvm-19.1.7-lib/lib/libLLVM-19.so";

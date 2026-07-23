@@ -1,6 +1,6 @@
 // Benchmark Q4_K × Q8_1 matmul — measure TOPS on RTX 3090
 import { dlopen, ptr as ffiPtr, CString } from "bun:ffi";
-import { kernel, ptr, f32, i32, i8, i16, struct, array, sizeof } from "./dsl";
+import { kernel, ptr, f32, i32, i8, i16, struct, array, sizeof } from "../src/dsl";
 
 // ─── Struct definitions ─────────────────────────────────────────────
 const Q8_1 = struct({ q: array(i8, 32), d: i16, s: i16 }, "Q8_1");
