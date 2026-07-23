@@ -287,3 +287,50 @@ underutilizes the GPU — exactly Qwen3.5's steady-state inference regime:
 ### Builder addition
 `TTIRBuilder.build(name, numWarps, numStages?)` now emits `ttg.num-stages` for
 software pipelining (read by the shim's pass pipeline).
+
+## fa2_autotune.ts — autotune FA2 over (BM, BN, warps, stages)
+
+Applies the framework's CUDA-event autotuning pattern (`bench/autotune.ts`) to
+the FA2 port — the framework picks the config instead of a hand-picked one, and
+re-tunes per problem size / GPU.
+
+```bash
+bun run prototypes/fa2_autotune.ts
+# env: Hq=8 Hkv=2 SEQ=2048 D=128   (search: BM,BN∈{32,64,128} × w∈{4,8} × s∈{2,3,4})
+```
+
+**Crucially, the autotuner filters by CORRECTNESS** (small-size check vs the
+host reference), not just launch success. This matters: it caught that the
+fastest-looking config (BM=32 BN=64, ~50 TFLOPS) was **fast-but-wrong**, and
+rejected every `BN > BM` config:
+
+```
+BM=32 BN=64 w=4 s=2   incorrect ✗ (skip)   ← would have "won" at ~50 TFLOPS but is WRONG
+BM=64 BN=128 ...       incorrect ✗ (skip)   ← all BN>BM configs are broken
+...
+BEST: BM=32 BN=32 w=4 s=4 → 39.20 TFLOPS   verify best config: max err 0.0003 ✓ correct
+```
+
+### Result (RTX 3090, 8h/2kv GQA, 2048×2048×128, CUDA-event timed)
+| port / config | throughput | correct |
+|---|---|---|
+| fa2_clean (1 head) | 4.23 TFLOPS | ✓ |
+| fa2_vllm hand-pick BM=64/64 | 29.5 TFLOPS | ✓ |
+| **fa2_vllm autotuned BM=32/32 w=4 s=4** | **39.2 TFLOPS** | ✓ |
+
+~39 TFLOPS = **55% of the 3090's 71 TFLOPS f16 peak**. The autotuner lifted the
+hand-pick 29.5 → 39.2 (1.3×) by searching square small tiles, and — just as
+important — refused to report the invalid 50 TFLOPS config.
+
+### Findings from the sweep
+- **`w=4` always beats `w=8`** here (8 warps over-subscribes these tile sizes).
+- **Square or BN≤BM tiles** are required for correctness with the current
+  two-stage diagonal mask (see bug below); `BN > BM` is broken.
+- `num_stages` has only a marginal effect (~1–3%); occupancy and tile shape
+  dominate.
+
+### Known bug surfaced by the autotuner
+When `BN > BM` (K-tile wider than the Q-block), the two-stage diagonal mask /
+`tpK` advancement produces wrong output. The autotuner's correctness filter
+makes this safe (it skips those configs), but the diagonal-stage masking should
+be fixed to handle `BN > BM` (useful — wider K-tiles can be faster when correct).

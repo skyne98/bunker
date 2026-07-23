@@ -47,7 +47,7 @@ function attnTile(bb: TTIRBuilder, q: any, kt: any, v: any, acc: any, m_i: any, 
   return [accNew, m_ij, lNew] as const;
 }
 
-function buildFA2vllm(Hq: number, Hkv: number, M: number, N: number, D: number,
+export function buildFA2vllm(Hq: number, Hkv: number, M: number, N: number, D: number,
                       BM: number, BN: number, numWarps = 4, numStages = 3) {
   const G = Hq / Hkv;
   const b = new TTIRBuilder();
@@ -107,7 +107,7 @@ function buildFA2vllm(Hq: number, Hkv: number, M: number, N: number, D: number,
 }
 
 // ── host reference (multi-head GQA causal attention, from f32 source) ──
-function refAttn(Qf: Float32Array, Kf: Float32Array, Vf: Float32Array,
+export function refAttn(Qf: Float32Array, Kf: Float32Array, Vf: Float32Array,
                  Hq: number, Hkv: number, M: number, N: number, D: number) {
   const G = Hq / Hkv;
   const O = new Float32Array(Hq * M * D);
@@ -137,10 +137,11 @@ function refAttn(Qf: Float32Array, Kf: Float32Array, Vf: Float32Array,
 async function main() {
   // correctness
   {
-    const Hq = 8, Hkv = 2, M = 256, N = 256, D = 64, BM = 64, BN = 64, G = Hq / Hkv;
-    const ttir = buildFA2vllm(Hq, Hkv, M, N, D, BM, BN);
+    const Hq = 8, Hkv = 2, M = 256, N = 256, D = 64, BM = Number(process.env.BM||64), BN = Number(process.env.BN||64), G = Hq / Hkv;
+    const NW = Number(process.env.WARPS||4), NS = Number(process.env.STAGES||3);
+    const ttir = buildFA2vllm(Hq, Hkv, M, N, D, BM, BN, NW, NS);
     if (process.env.DUMP) { console.log(ttir); process.exit(0); }
-    const k = compileAndLoad(ttir, "fa2_vllm", 4);
+    const k = compileAndLoad(ttir, "fa2_vllm", NW);
     console.log(`fa2_vllm loaded (shmem=${k.shmem}, GQA G=${G})`);
 
     const Qf = new Float32Array(Hq * M * D).map(() => (Math.random() * 2 - 1) * 0.5);
@@ -165,8 +166,8 @@ async function main() {
 
   // benchmark
   {
-    const Hq = 8, Hkv = 2, M = 2048, N = 2048, D = 128, BM = Number(process.env.BM||64), BN = Number(process.env.BN||64);
-    const NW = Number(process.env.WARPS||4), NS = Number(process.env.STAGES||3);
+    const Hq = 8, Hkv = 2, M = 2048, N = 2048, D = 128, BM = Number(process.env.BM||32), BN = Number(process.env.BN||32);
+    const NW = Number(process.env.WARPS||4), NS = Number(process.env.STAGES||4);
     const ttir = buildFA2vllm(Hq, Hkv, M, N, D, BM, BN, NW, NS);
     const k = compileAndLoad(ttir, "fa2_vllm", NW);
     const Q = f32to16(new Float32Array(Hq * M * D).map(() => (Math.random() * 2 - 1) * 0.5));
@@ -186,4 +187,4 @@ async function main() {
     cuFree(dQ); cuFree(dK); cuFree(dV); cuFree(dO);
   }
 }
-main();
+if (import.meta.main) main();
