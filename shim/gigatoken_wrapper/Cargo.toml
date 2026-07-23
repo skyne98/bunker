@@ -1,0 +1,16 @@
+[package]
+name = "gigatoken_wrapper"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "gigatoken_wrapper"
+crate-type = ["cdylib"]
+
+[dependencies]
+gigatoken = { path = "/tmp/gigatoken_pure" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

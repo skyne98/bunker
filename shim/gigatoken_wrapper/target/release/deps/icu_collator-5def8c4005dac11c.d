@@ -1,0 +1,11 @@
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/icu_collator-5def8c4005dac11c.d: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/comparison.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/elements.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/options.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/provider.rs
+
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/libicu_collator-5def8c4005dac11c.rlib: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/comparison.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/elements.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/options.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/provider.rs
+
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/libicu_collator-5def8c4005dac11c.rmeta: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/comparison.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/elements.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/options.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/provider.rs
+
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/lib.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/comparison.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/elements.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/options.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_collator-2.2.1/src/provider.rs:

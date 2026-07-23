@@ -1,0 +1,12 @@
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/sonic_simd-9f2ead07ffabdc71.d: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/bits.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/traits.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/sse2.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/v256.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/v512.rs
+
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/libsonic_simd-9f2ead07ffabdc71.rlib: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/bits.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/traits.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/sse2.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/v256.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/v512.rs
+
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/libsonic_simd-9f2ead07ffabdc71.rmeta: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/bits.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/traits.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/sse2.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/v256.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/v512.rs
+
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/lib.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/bits.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/traits.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/sse2.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/v256.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sonic-simd-0.1.4/src/v512.rs:

@@ -1,0 +1,15 @@
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/thiserror-6e08b64cf93a4924.d: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/aserror.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/display.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/provide.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/var.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/private.rs /home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/build/thiserror-6f44dd6169d69ede/out/private.rs
+
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/libthiserror-6e08b64cf93a4924.rlib: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/aserror.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/display.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/provide.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/var.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/private.rs /home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/build/thiserror-6f44dd6169d69ede/out/private.rs
+
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/libthiserror-6e08b64cf93a4924.rmeta: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/aserror.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/display.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/provide.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/var.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/private.rs /home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/build/thiserror-6f44dd6169d69ede/out/private.rs
+
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/lib.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/aserror.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/display.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/provide.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/var.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.19/src/private.rs:
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/build/thiserror-6f44dd6169d69ede/out/private.rs:
+
+# env-dep:OUT_DIR=/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/build/thiserror-6f44dd6169d69ede/out

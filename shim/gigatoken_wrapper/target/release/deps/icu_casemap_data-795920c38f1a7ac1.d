@@ -1,0 +1,10 @@
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/icu_casemap_data-795920c38f1a7ac1.d: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/mod.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/case_map_unfold_v1.rs.data /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/case_map_v1.rs.data
+
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/libicu_casemap_data-795920c38f1a7ac1.rlib: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/mod.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/case_map_unfold_v1.rs.data /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/case_map_v1.rs.data
+
+/home/fox/Project/bunker/shim/gigatoken_wrapper/target/release/deps/libicu_casemap_data-795920c38f1a7ac1.rmeta: /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/lib.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/mod.rs /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/case_map_unfold_v1.rs.data /home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/case_map_v1.rs.data
+
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/lib.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/mod.rs:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/case_map_unfold_v1.rs.data:
+/home/fox/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/icu_casemap_data-2.2.0/src/../data/case_map_v1.rs.data:
