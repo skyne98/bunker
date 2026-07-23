@@ -118,7 +118,7 @@ function buildFwdH(BH: number, nC: number, C: number, DK: number, DV: number, BV
     bb.store(tpVN, vNew, { boundaryCheck: [0, 1] });
     return [bb.add(h, dot16(bb, bb.trans(k), vNew))];
   });
-  return b.build("gdn_fwd_h", 4);
+  return b.build("gdn_fwd_h", 4, 4);
 }
 
 // ── 5. fwd_o: o = scale(q@h + tril(q@kᵀ)@v_new) ──────────────────────
@@ -142,7 +142,7 @@ function buildFwdO(BH: number, nC: number, C: number, DK: number, DV: number, BV
   const ar = b.arange(0, C);
   const lower = b.ge(b.broadcast(b.expandDims(ar, 1), [C, C]), b.broadcast(b.expandDims(ar, 0), [C, C]));
   b.store(tpO, b.add(b.mul(oInter, scale), b.mul(dot16(b, b.select(lower, qk, b.splat(b.f32(0), [C, C], "f32")), vn), scale)), { boundaryCheck: [0, 1] });
-  return b.build("gdn_fwd_o", 4);
+  return b.build("gdn_fwd_o", 4, 4);
 }
 
 // reference: naive O(T) recurrence
@@ -164,7 +164,7 @@ function refRecur(Q: Float32Array, K: Float32Array, V: Float32Array, B: Float32A
   return O;
 }
 
-const BH = 32, T = Number(process.env.TP||512), DK = 128, DV = 128, C = 64, BV = 64;
+const BH = 32, T = Number(process.env.TP||512), DK = 128, DV = 128, C = 64, BV = 32;
 const nC = T / C;
 const kKKT = compileAndLoad(buildKkt(BH, nC, C, DK), "kkt_fwd", 4);
 const kST  = compileAndLoad(buildSolveTril64(BH, nC), "solve_tril64", 4);
