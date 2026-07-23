@@ -19,8 +19,8 @@ const flops = 4 * Hq * M * N * D; // 2·(QK+PV) per q-head
 
 // search space (configs that don't compile or are invalid are skipped)
 const SPACE: { BM: number; BN: number; w: number; s: number }[] = [];
-for (const BM of [32, 64, 128]) for (const BN of [32, 64, 128])
-  for (const w of [4, 8]) for (const s of [2, 3, 4])
+for (const BM of [16, 32, 48, 64]) for (const BN of [16, 32, 48, 64, 128])
+  for (const w of [2, 4, 8]) for (const s of [2, 3, 4, 5, 6])
     SPACE.push({ BM, BN, w, s });
 
 // inputs (shared across configs)

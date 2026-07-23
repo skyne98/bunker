@@ -361,3 +361,29 @@ is now both correct AND the fastest:
 **Autotuned best: BM=32 BN=64 w=4 s=3 → 47.5 TFLOPS** (max err 0.0002) =
 **67% of the 3090's 71 TFLOPS f16 peak**. The bugfix lifted the honest best
 39.2 → 47.5 (1.2×) by making the faster wide-K-tile config valid.
+
+### Going faster: efficiency scales with sequence length (same kernel)
+
+The autotune is maxed at ~48 TFLOPS for M=2048 (a 300-config search over
+BM∈{16,32,48,64}, BN∈{16,32,48,64,128}, warps∈{2,4,8}, stages∈{2..6} found
+nothing better than BM=32 BN=64 w=4). Further gains at fixed size need
+*algorithmic* changes, not config — but FA2 efficiency climbs naturally with
+sequence length (overhead amortizes, tiles saturate). Same kernel, same best
+config, varying M (RTX 3090, 8h/2kv GQA, D=128):
+
+| M | throughput | % of 71 TFLOPS f16 peak |
+|---|---|---|
+| 1024 | 36.2 TFLOPS | 51% |
+| 2048 | 46.2 TFLOPS | 65% |
+| 4096 | 52.9 TFLOPS | 74% |
+| **8192** | **60.3 TFLOPS** | **85%** |
+
+So at long contexts the port reaches **60 TFLOPS (85% of peak)**.
+
+### The remaining gap is fundamental to FA2 on Ampere
+The ~15% gap to peak is tensor cores sitting idle during the softmax/max/exp/
+rescale between the QK and PV dots (those are CUDA-core ops). Closing it
+requires **FA3-style warp specialization** (producer/consumer warps that
+overlap softmax with matmul) — which needs **Hopper+ (TMA + wgmma async)** and
+is **not available on the 3090 (sm_86, Ampere)**. So ~60 TFLOPS at long context
+is near the FA2 ceiling on this GPU; FA3 would be the path on Hopper/Blackwell.

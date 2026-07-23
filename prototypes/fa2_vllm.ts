@@ -170,7 +170,7 @@ async function main() {
 
   // benchmark
   {
-    const Hq = 8, Hkv = 2, M = 2048, N = 2048, D = 128, BM = Number(process.env.BM||32), BN = Number(process.env.BN||64);
+    const Hq = 8, Hkv = 2, M = Number(process.env.SEQ||2048), N = M, D = 128, BM = Number(process.env.BM||32), BN = Number(process.env.BN||64);
     const NW = Number(process.env.WARPS||4), NS = Number(process.env.STAGES||3);
     const ttir = buildFA2vllm(Hq, Hkv, M, N, D, BM, BN, NW, NS);
     const k = compileAndLoad(ttir, "fa2_vllm", NW);
