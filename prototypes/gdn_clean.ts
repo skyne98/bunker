@@ -117,3 +117,23 @@ for (let i = 0; i < O.length; i++) {
 }
 console.log(ok ? `✓ gdn_clean correct (max err ${maxErr.toExponential(2)})` : "✗ FAILED");
 cuFree(dQ); cuFree(dK); cuFree(dKB); cuFree(dVB); cuFree(dO);
+
+// bench: naive O(T) recurrence at the same size as gdn_chunk for comparison
+{
+  const BH = 4, T = 512, DK = 128, DV = 128;
+  const kn = compileAndLoad(buildGDN(BH, T, DK, DV), "gdn_clean", 4);
+  const Q2 = new Float32Array(BH * T * DK).map(rnd), K2 = new Float32Array(BH * T * DK).map(rnd);
+  const B2 = new Float32Array(BH * T).map(() => Math.random() * 0.8 + 0.1), V2 = new Float32Array(BH * T * DV).map(rnd);
+  const KB2 = new Float32Array(BH * T * DK), VB2 = new Float32Array(BH * T * DV), O2 = new Float32Array(BH * T * DV);
+  for (let i = 0; i < BH * T; i++) { for (let d = 0; d < DK; d++) KB2[i * DK + d] = K2[i * DK + d] * B2[i]; for (let d = 0; d < DV; d++) VB2[i * DV + d] = V2[i * DV + d] * B2[i]; }
+  const dQ2 = cuAlloc(Q2.byteLength), dK2 = cuAlloc(K2.byteLength), dKB2 = cuAlloc(KB2.byteLength), dVB2 = cuAlloc(VB2.byteLength), dO2 = cuAlloc(O2.byteLength);
+  cuHtoD(dQ2, Q2.buffer); cuHtoD(dK2, K2.buffer); cuHtoD(dKB2, KB2.buffer); cuHtoD(dVB2, VB2.buffer);
+  for (let i = 0; i < 3; i++) cuLaunch(kn, [BH, 1, 1], [128, 1, 1], [dQ2, dK2, dKB2, dVB2, dO2]);
+  cuSync();
+  const t0 = performance.now(), it = 20;
+  for (let i = 0; i < it; i++) cuLaunch(kn, [BH, 1, 1], [128, 1, 1], [dQ2, dK2, dKB2, dVB2, dO2]);
+  cuSync();
+  const dt = (performance.now() - t0) / 1000 / it;
+  console.log(`bench naive-recurrence BH=${BH} T=${T} d=${DK}: ${(dt * 1e6).toFixed(1)} µs/it`);
+  cuFree(dQ2); cuFree(dK2); cuFree(dKB2); cuFree(dVB2); cuFree(dO2);
+}

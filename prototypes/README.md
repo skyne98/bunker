@@ -625,3 +625,39 @@ pairing rewrite could recover some). conv1d at 77% is near memory-bound.
   worked because it used kernel.ts throughout.)
 - The 0-d-tensor builder limitation (from gdn_gated) also blocks in-kernel L2-norm of
   a single vector — use a 2-D row-wise kernel instead.
+
+## gdn_chunk.ts — chunked-parallel GatedDeltaNet prefill (clean port)
+
+Ports fla's `naive_chunk_gated_delta_rule` / `delta_rule_chunkwise` — the
+**chunked-parallel** form (parallel within chunks via matmuls + recurrence
+across chunks carrying `S`), as opposed to the O(T) sequential `gdn_clean`.
+
+**Key porting trick:** the reference computes (I−L)⁻¹ (L = strict-lower of
+−(k_beta·kᵀ)) via row-by-row forward substitution (Python slicing). The tile
+model has no dynamic slicing, so it uses the **finite Neumann series** — L is
+strict-lower ⇒ nilpotent (L^C=0) ⇒ (I−L)⁻¹ = I + L + L² + … + L^{C−1}, a
+`scf.for` accumulating matrix powers (pure `tt.dot`). The inter-chunk `S`
+recurrence is the FA2/matmul `scf.for`-iter-arg pattern.
+
+- **correct: max err 4.47e-8** vs the fla reference (BH=2, T=64, d_k=d_v=128, C=16)
+  — the chunked algorithm IS correctly expressible in TTIR.
+
+### Honest result: correct but NOT yet faster than the naive recurrence
+| variant | BH=4, T=512, d=128 | |
+|---|---|---|
+| naive O(T) recurrence (gdn_clean) | 830 µs | |
+| chunked (gdn_chunk, Neumann WY, C=16) | 5192 µs | **6× slower** |
+
+The clean chunked port is **slower**, not faster. Two reasons:
+1. **Neumann-series WY is O(C³) per chunk** — more work than the recurrence's
+   matvecs. fla's real kernel uses the **efficient forward-substitution WY**
+   (O(C²)), but that needs row slicing (not in the tile model).
+2. **Per-(batch,head) grid = only 4 programs** → severe under-occupancy (4
+   programs on 82 SMs). fla parallelizes over **state-dim blocks** (`S` tiled
+   into `[BK,BV]`, grid `[B·H, NK, NV]`) for occupancy — a bigger restructure.
+
+So the chunked **algorithm** is ported and verified, but achieving the actual
+speedup (the whole point of chunking) needs the efficient WY + state-dim
+tiling for occupancy — the sophistication in fla's tuned triton kernels. This
+remains future work; the naive recurrence (`gdn_clean`/`gdn_gated`) is
+currently the faster correct path.
