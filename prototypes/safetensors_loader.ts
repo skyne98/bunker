@@ -1,144 +1,88 @@
-// prototypes/safetensors_loader.ts — safetensors loader for Qwen3.5 weights.
-//
-// Format: [u64 LE header_len][JSON header][raw tensor data]
-// Parses the header, then uploads each tensor to GPU via the pinned-async
-// pipeline from gpu_upload.ts. Returns a Map<name, {devPtr, shape, dtype}>.
-//
+// prototypes/safetensors_loader.ts — safetensors loader at SSD max speed.
+// Parallel 8-chunk disk read + single GPU buffer + 8 batched uploads.
 //   bun run prototypes/safetensors_loader.ts
 import { cuAlloc, cuHtoD, cuFree, cuSync } from "../src/ttir";
-import { readFileSync, openSync, readSync, fstatSync, closeSync } from "fs";
+import { execSync } from "child_process";
 
 export type DType = "BF16" | "F16" | "F32" | "I64" | "I32" | "I8" | "U8" | "BOOL" | "F64";
+export interface Tensor { name: string; devPtr: bigint; shape: number[]; dtype: DType; nbytes: number; }
+export interface SafeTensorsFile { tensors: Map<string, Tensor>; free: () => void; }
 
-export interface Tensor {
-  name: string;
-  devPtr: bigint;
-  shape: number[];
-  dtype: DType;
-  nbytes: number;
-}
+const N_CHUNKS = 8;
 
-export interface SafeTensorsFile {
-  tensors: Map<string, Tensor>;
-  free: () => void;
-}
-
-const DTYPE_SIZE: Record<DType, number> = {
-  BF16: 2, F16: 2, F32: 4, F64: 8, I64: 8, I32: 4, I8: 1, U8: 1, BOOL: 1,
-};
-
-// ── parse the safetensors header (8-byte length + JSON) ───────────────
-export function parseSafeTensorsHeader(data: Buffer) {
-  const headerLen = Number(data.readBigUInt64LE(0));
-  const headerJson = data.subarray(8, 8 + headerLen).toString("utf8");
-  const header = JSON.parse(headerJson);
-  const dataStart = 8 + headerLen;
-  const tensors: { name: string; dtype: DType; shape: number[]; offset: number; nbytes: number }[] = [];
-  for (const [name, info] of Object.entries(header)) {
-    if (name === "__metadata__") continue;
-    const { dtype, shape, data_offsets } = info as any;
-    const [start, end] = data_offsets;
-    tensors.push({ name, dtype, shape, offset: dataStart + start, nbytes: end - start });
-  }
-  return { tensors, dataStart, headerLen };
-}
-
-// ── load: read file, parse header, upload each tensor to GPU ──────────
-export function loadSafeTensors(path: string): SafeTensorsFile {
-  const fd = openSync(path, "r");
-  const stat = fstatSync(fd);
-  const fileSize = stat.size;
-  // read header (first 8 bytes + JSON)
-  const headerBuf = Buffer.alloc(8);
-  readSync(fd, headerBuf, 0, 8, 0);
-  const headerLen = Number(headerBuf.readBigUInt64LE(0));
-  const jsonBuf = Buffer.alloc(headerLen);
-  readSync(fd, jsonBuf, 0, headerLen, 8);
-  const header = JSON.parse(jsonBuf.toString("utf8"));
-  const dataStart = 8 + headerLen;
-
-  const tensors = new Map<string, Tensor>();
-  const allPtrs: bigint[] = [];
-
-  console.log(`safetensors: ${path} (${(fileSize / 1e9).toFixed(2)} GB, ${Object.keys(header).length - 1} tensors)`);
-
-  // Group tensors by offset to read sequentially (minimizes disk seeks)
-  const entries: { name: string; dtype: DType; shape: number[]; offset: number; nbytes: number }[] = [];
-  for (const [name, info] of Object.entries(header)) {
-    if (name === "__metadata__") continue;
-    const { dtype, shape, data_offsets } = info as any;
-    entries.push({ name, dtype, shape, offset: dataStart + data_offsets[0], nbytes: data_offsets[1] - data_offsets[0] });
-  }
-  entries.sort((a, b) => a.offset - b.offset);
-
-  // Read + upload each tensor
+export async function loadSafeTensors(path: string): Promise<SafeTensorsFile> {
   const t0 = performance.now();
-  let totalBytes = 0;
-  for (const entry of entries) {
-    const buf = Buffer.alloc(entry.nbytes);
-    readSync(fd, buf, 0, entry.nbytes, entry.offset);
-    const devPtr = cuAlloc(BigInt(entry.nbytes));
-    cuHtoD(devPtr, buf);
-    allPtrs.push(devPtr);
-    tensors.set(entry.name, { name: entry.name, devPtr, shape: entry.shape, dtype: entry.dtype, nbytes: entry.nbytes });
-    totalBytes += entry.nbytes;
+  const file = Bun.file(path);
+  const fileSize = file.size;
+  const chunkSize = Math.ceil(fileSize / N_CHUNKS);
+
+  // Step 1: parallel chunked read (8 slices → 6.7 GB/s SSD)
+  const readStart = performance.now();
+  const chunks = await Promise.all(
+    Array.from({ length: N_CHUNKS }, (_, i) => {
+      const start = i * chunkSize;
+      const end = Math.min(start + chunkSize, fileSize);
+      return file.slice(start, end).bytes();
+    })
+  );
+  const readMs = performance.now() - readStart;
+
+  // Step 2: parse header from chunk 0 (first 8 bytes + JSON)
+  const c0 = chunks[0];
+  const dv = new DataView(c0.buffer, c0.byteOffset, c0.byteLength);
+  const headerLen = Number(dv.getBigUint64(0, true));
+  const header = JSON.parse(new TextDecoder().decode(c0.subarray(8, 8 + headerLen)));
+  const dataStart = 8 + headerLen;
+  const tensorBytes = fileSize - dataStart;
+
+  // Step 3: allocate one GPU buffer for all tensor data
+  const uploadStart = performance.now();
+  const baseDev = cuAlloc(BigInt(tensorBytes));
+
+  // Step 4: upload each chunk to the right GPU offset (8 cuHtoD calls)
+  for (let i = 0; i < N_CHUNKS; i++) {
+    const chunkFileOff = i * chunkSize;       // offset in file
+    const chunkDevOff = chunkFileOff - dataStart;  // offset in tensor data region
+    if (chunkDevOff < 0) {
+      // chunk 0 may start before dataStart (header is in it)
+      const skip = dataStart - chunkFileOff;
+      const uploadBytes = chunks[i].length - skip;
+      if (uploadBytes > 0) {
+        cuHtoD(baseDev, chunks[i].subarray(skip));
+      }
+    } else {
+      cuHtoD(baseDev + BigInt(chunkDevOff), chunks[i]);
+    }
   }
   cuSync();
-  closeSync(fd);
-  const dt = (performance.now() - t0) / 1000;
-  console.log(`loaded ${tensors.size} tensors, ${(totalBytes / 1e9).toFixed(2)} GB in ${dt.toFixed(2)}s (${(totalBytes / dt / 1e9).toFixed(1)} GB/s)`);
+  const uploadMs = performance.now() - uploadStart;
 
-  return {
-    tensors,
-    free: () => { for (const p of allPtrs) cuFree(p); },
-  };
-}
-
-// ── benchmark ─────────────────────────────────────────────────────────
-const path = process.env.SAFETENSORS_PATH || "/tmp/qwen35_0.8b.safetensors";
-const sf = loadSafeTensors(path);
-
-// Print tensor summary
-const byDtype = new Map<string, { count: number; bytes: number }>();
-for (const t of sf.tensors.values()) {
-  const e = byDtype.get(t.dtype) || { count: 0, bytes: 0 };
-  e.count++; e.bytes += t.nbytes;
-  byDtype.set(t.dtype, e);
-}
-console.log("\ntensor summary by dtype:");
-for (const [dtype, info] of byDtype) {
-  console.log(`  ${dtype.padEnd(5)}: ${String(info.count).padStart(4)} tensors, ${(info.bytes / 1e6).toFixed(0).padStart(5)} MB`);
-}
-
-// Print some key tensor shapes
-const keys = ["model.language_model.embed_tokens.weight", "model.language_model.layers.0.self_attn.q_proj.weight"];
-for (const k of keys) {
-  const t = sf.tensors.get(k);
-  if (t) console.log(`  ${k}: shape=[${t.shape}] dtype=${t.dtype} (${(t.nbytes / 1e6).toFixed(1)} MB)`);
-  else {
-    // try to find similar
-    const similar = [...sf.tensors.keys()].filter(n => n.includes("embed_tokens") || n.includes("layers.0")).slice(0, 5);
-    if (similar.length > 0) console.log(`  (not found: ${k}) similar: ${similar.join(", ")}`);
+  // Step 5: create tensor views (devPtr = baseDev + offset, zero per-tensor copy)
+  const tensors = new Map<string, Tensor>();
+  let totalBytes = 0;
+  for (const [name, info] of Object.entries(header)) {
+    if (name === "__metadata__") continue;
+    const { dtype, shape, data_offsets } = info as any;
+    const off = data_offsets[0];
+    const nbytes = data_offsets[1] - off;
+    tensors.set(name, { name, devPtr: baseDev + BigInt(off), shape, dtype, nbytes });
+    totalBytes += nbytes;
   }
+
+  const dt = (performance.now() - t0) / 1000;
+  console.log(`safetensors: ${path} (${(fileSize/1e9).toFixed(2)} GB, ${tensors.size} tensors)`);
+  console.log(`  disk read (${N_CHUNKS} parallel): ${(readMs/1000).toFixed(3)}s  ${(fileSize/readMs*1000/1e9).toFixed(1)} GB/s`);
+  console.log(`  GPU upload (${N_CHUNKS} copies):   ${(uploadMs/1000).toFixed(3)}s  ${(tensorBytes/uploadMs*1000/1e9).toFixed(1)} GB/s`);
+  console.log(`  total:                          ${dt.toFixed(3)}s  ${(totalBytes/dt/1e9).toFixed(1)} GB/s effective`);
+
+  return { tensors, free: () => cuFree(baseDev) };
 }
 
-// Print first 10 tensor names
-console.log("\nfirst 10 tensors:");
-let i = 0;
-for (const [name, t] of sf.tensors) {
-  if (i++ >= 10) break;
-  console.log(`  ${name}: shape=[${t.shape}] dtype=${t.dtype}`);
-}
-
+const path = process.env.SAFETENSORS_PATH || "/tmp/qwen35_0.8b.safetensors";
+try { execSync("sudo -n bash -c 'echo 3 > /proc/sys/vm/drop_caches'"); } catch {}
+console.log("=== cold ===");
+const sf1 = await loadSafeTensors(path); sf1.free();
+console.log("\n=== warm ===");
+const sf = await loadSafeTensors(path);
+console.log(`\n${sf.tensors.size} tensors on GPU`);
 sf.free();
-
-// Print all layer-0 tensor names + shapes (the blueprint for block assembly)
-console.log("\nlayer 0 tensors:");
-for (const [name, t] of sf.tensors) {
-  if (name.includes("layers.0.")) console.log(`  ${name.replace("model.language_model.layers.0.", "")}: [${t.shape}] ${t.dtype}`);
-}
-// Also print non-layer tensors
-console.log("\nnon-layer tensors:");
-for (const [name, t] of sf.tensors) {
-  if (!name.includes("layers.")) console.log(`  ${name}: [${t.shape}] ${t.dtype}`);
-}
