@@ -475,3 +475,34 @@ Next milestone: **assemble a complete full-attention block** end-to-end
 (`RMSNorm → QKV-proj → RoPE → FA2 → O-proj → +residual → RMSNorm → gate/up →
 SwiGLU → down → +residual`) and verify vs a reference, then the GatedDeltaNet
 linear-attention layers (the remaining 75%).
+
+## gdn_clean.ts — GatedDeltaNet (Qwen3.5 linear attention), clean recurrence
+
+The **18/24 linear-attention layers are the core of Qwen3.5**. This is the
+"clean first" port — the naive delta-rule recurrence (fla's
+`delta_rule_recurrence`), proving the recurrence works in TTIR. Conv1d, the
+decay gate, and the chunked-parallel prefill come next; this validates the core
+algorithm and the `scf.for`-with-state-`S` pattern.
+
+Per token (β folded on host as `kb=k·β`, `vb=v·β`; q scaled by 1/√d_k):
+```
+delta = vb − (kb·S)        # kb·S = Σ kb[:,None]·S  (reduce axis 0)  → [d_v]
+S    += k ⊗ delta          # outer product                         → [d_k, d_v]
+o     = q · S              # = Σ q[:,None]·S  (reduce axis 0)        → [d_v]
+```
+The state `S` `[d_k, d_v]` (128×128) is carried as a `scf.for` iter-arg — the
+same pattern as the FA2/matmul K-loop. Pure elementwise + `tt.reduce` +
+broadcast; no dot, no libdevice.
+
+- correct: **max err 5.96e-8** vs the fla reference (BH=4, T=64, d_k=d_v=128)
+- (Sequential O(T) loop — correct but slow; the chunked-parallel prefill is the
+  fast version, to port next.)
+
+### GatedDeltaNet remaining work
+1. conv1d (depthwise causal, k=4) on qkv — pure mul/add, no libdevice.
+2. decay gate `S *= exp(g)`, `g = −exp(A_log)·softplus(a+dt_bias)` — `exp`
+   inlines; `softplus=log(1+exp)` needs `log` (libdevice) or a polynomial approx.
+3. L2-norm of q/k — Newton-Raphson `rsqrt` (proven in rmsnorm.ts).
+4. output RMSNormGated + out_proj.
+5. **chunked-parallel prefill** (the fast version: WY representation + chunk
+   recurrence — structurally the FA2/matmul K-loop with iter-arg `S`).
