@@ -421,3 +421,57 @@ GatedDeltaNet's L2-normalization of q/k will use the same approach.
 
 ### Builder note
 `tt.load`'s `padding` attribute only allows `1` (zero-pad) or `2` (NaN), not `0`.
+
+## swiglu.ts — SwiGLU activation (Qwen3.5 MLP)
+
+`MLP(x) = down( silu(gate(x)) · up(x) )`, `silu(x)=x·σ(x)=x/(1+e^{-x})`. The
+gate/up/down are GEMMs (existing matmul kernel); this is the fused elementwise
+activation between them: `act = silu(gate) · up`. Pure elementwise, `exp` inlines
+→ no libdevice.
+
+- correct: max err 1.19e-7
+- 766 GB/s effective (3-tensor: read gate+up, write out) ≈ 82% of HBM peak
+
+## rope.ts — Rotary Position Embedding (Qwen3.5 full-attention)
+
+`mrope_interleaved=true` (interleaved pairs), `partial_rotary=0.25`
+(rotate first 64 of 256 head dims; the rest pass through), `rope_theta=1e7`.
+
+```ts
+// per pair k (elements 2k, 2k+1):
+//   y[2k]   = x[2k]·cos - x[2k+1]·sin
+//   y[2k+1] = x[2k+1]·cos + x[2k]·sin
+//   y[j]    = x[j]  for j >= rotary_dim
+```
+
+**cos/sin are precomputed on the host** (exact, no libdevice) and passed as
+`[M, pairs]` tables — the kernel just loads + rotates. Interleaved pairs are
+formed via **pointer-tensor strided loads** (`splatPtr` + `addptr`): even offsets
+`m·hd + 0,2,4,…` and odd offsets `m·hd + 1,3,5,…`.
+
+- correct: max err 1.19e-7
+- 355 GB/s at 512×256 (launch-overhead-bound at this tiny size; RoPE is
+  memory-bound and scales toward HBM peak at larger M)
+
+### Two bugs found & fixed
+- **`makeTensorPtr` with `strides=[2]` does NOT strided-load** — it produces
+  wrong (contiguous) results. Use `splatPtr` + `addptr` pointer-tensors for
+  strided/gathered access instead.
+- **Flat 1D tiles overrun row boundaries**: a `[M·hd]` tensor with a 256-wide
+  tile for the 192-element non-rotary portion spilled into the next row
+  (`boundaryCheck` on a flat tensor can't see row boundaries). Fixed by using a
+  2D tiled pointer `[M, HEAD_DIM]` with block `[1, 256]` + `boundaryCheck[0,1]`.
+
+## Qwen3.5 full-attention block — all pieces now exist
+
+| piece | prototype | status |
+|---|---|---|
+| RMSNorm | rmsnorm.ts | ✅ ~100% HBM peak |
+| RoPE (interleaved, partial 0.25) | rope.ts | ✅ correct |
+| SwiGLU MLP activation | swiglu.ts | ✅ 82% HBM peak |
+| Full attention (FA2) | fa2_vllm.ts | ✅ ~60 TFLOPS @ 8192 |
+
+Next milestone: **assemble a complete full-attention block** end-to-end
+(`RMSNorm → QKV-proj → RoPE → FA2 → O-proj → +residual → RMSNorm → gate/up →
+SwiGLU → down → +residual`) and verify vs a reference, then the GatedDeltaNet
+linear-attention layers (the remaining 75%).
