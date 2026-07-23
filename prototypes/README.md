@@ -118,3 +118,69 @@ the **G** pattern: read in ~64 MB slices with bounded concurrency (~8),
 `cuMemHostRegister` each slice, `cuMemcpyHtoDAsync_v2` onto a stream, and
 `cuStreamSynchronize` once at the end. That hits the SSD's max (~7 GB/s on this
 box) with the upload fully hidden. The copy is never the limit on Gen4.
+
+## latency.ts — Lowest-latency SSD ↔ mem ↔ GPU (while keeping bandwidth)
+
+**Question:** Throughput is maximized by large chunks + deep queues, but those add
+queueing latency. What is the *latency* floor for a single tensor to travel
+SSD → host → GPU, and what chunk size keeps both latency low AND bandwidth high?
+
+```bash
+bun run prototypes/ssd_saturate.ts   # create the 1 GB test file
+bun run prototypes/latency.ts
+```
+Requires passwordless sudo (cold reads via `drop_caches`); pre-opens the file fd
+and uses `pread`/`fs.readSync` to avoid event-loop jitter; pinned host memory
+registered once and reused.
+
+### Latency floors (single op, RTX 3090 + Lexar NM790)
+| Path | 4 KB | 64 KB | 256 KB | 1 MB | 4 MB |
+|---|---|---|---|---|---|
+| SSD read (cold random) | 117 µs | 161 µs | 320 µs | 678 µs | 1645 µs |
+| SSD read (warm/cached) | ~0 µs | 1 µs | 3 µs | 16 µs | 66 µs |
+| Host→GPU (pinned) | 5 µs | 7 µs | 15 µs | 54 µs | 171 µs |
+| GPU→Host (pinned) | 5 µs | 7 µs | 14 µs | 55 µs | 174 µs |
+| **E2E SSD→GPU (no overlap)** | **89 µs** | 140 µs | 317 µs | 723 µs | 1844 µs |
+
+**Floors:** NVMe random-read floor ≈ **66–117 µs** (4 KB, device-bound). PCIe
+upload floor ≈ **5 µs** (tiny transfers are API-overhead-bound; HtoD ≈ DtoH).
+End-to-end floor for a tiny tensor ≈ **89 µs** — **dominated by the SSD, not the
+GPU/PCIe.** You cannot get a cold SSD→GPU op below the device read latency.
+
+### Latency vs throughput tradeoff (stream 256 MB, chunked+pinned+async)
+| Chunk | Bandwidth | Per-item latency |
+|---|---|---|
+| 64 KB | 3.4 GB/s | 132 µs |
+| 256 KB | 4.9 GB/s | 302 µs |
+| **1 MB** | **6.2 GB/s** | **747 µs** ← knee |
+| 4 MB | 6.2 GB/s | 1915 µs |
+
+(Bandwidth here is indicative — small 256 MB total; full 7 GB/s needs ≥1 GB, see
+`gpu_upload.ts`. The point is the *shape* of the tradeoff.)
+
+### Findings
+1. **The SSD is the latency floor, not the GPU.** A 4 KB cold SSD→GPU op takes
+   ~89 µs, of which ~5 µs is the upload. NVMe random-read latency (~70–120 µs)
+   sets the lower bound for any single small transfer.
+2. **The sweet spot is 256 KB–1 MB.** At **1 MB** you hit ~max bandwidth
+   (~6.2 GB/s ≈ 90% of the SSD ceiling) with **sub-ms latency (~0.75 ms)**.
+   Going smaller buys negligible latency but loses bandwidth fast (64 KB → 3.4 GB/s).
+   Going larger gives no more bandwidth but linearly more latency.
+3. **Pinned memory matters for latency too**, not just throughput: async HtoD
+   from pinned mem has a ~5 µs floor; from unpinned it degrades toward sync and
+   adds overhead.
+4. **Pre-open fds + pread.** `open()` per read is ~10–20 µs of pure avoidable
+   latency; a persistent fd + positional `readSync`/`pread` removes it.
+5. **No overlap for lowest latency.** The chunked pipeline that maximizes
+   bandwidth queues items (each waits behind others). For *lowest single-op
+   latency*, issue one small transfer with no queueing — accept the ~89 µs floor.
+
+### Takeaway for bunker
+- For **latency-critical** small tensor loads (e.g., a single KV-cache page,
+  weight slice): pre-open the file fd, use a pre-registered pinned buffer, read
+  ~4–64 KB and async-upload — **~90–140 µs end-to-end**, SSD-bound.
+- For **bandwidth-critical** bulk loads: chunk at **~1 MB** with the pinned+async
+  pipeline (`gpu_upload.ts` strategy G) — ~6–7 GB/s with ~0.75 ms per item.
+- 1 MB chunks are the universal sweet spot: ~90% of max bandwidth at sub-ms
+  latency. Drop to 64 KB only if you need the absolute lowest per-op latency and
+  can afford the bandwidth hit.
