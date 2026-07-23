@@ -720,6 +720,26 @@ export class TTIRBuilder {
   log(a: Value): Value { return this.math1(a, "log"); }
   sqrt(a: Value): Value { return this.math1(a, "sqrt"); }
   rsqrt(a: Value): Value { return this.math1(a, "rsqrt"); }
+
+  /**
+   * `tt.elementwise_inline_asm` — emit inline PTX assembly.
+   * Avoids libdevice for ops like rsqrt.approx.f32, sqrt.approx.f32.
+   * `asmStr` should end with `;`, constraints follow LLVM inline asm conventions.
+   */
+  inlineAsm(asmStr: string, constraints: string, args: Value[], outShape: number[], outElem: ScalarElem, isPure = true, pack = 1): Value {
+    if (!asmStr.endsWith(";")) asmStr += ";";
+    const r = this.fresh("asm");
+    const argNames = args.map(a => a.name).join(", ");
+    const argTypes = args.map(a => typeText(a.type)).join(", ");
+    const outType = typeText({ shape: outShape, elem: outElem });
+    this.emit(`%${r} = "tt.elementwise_inline_asm"(${argNames}) <{asm_string = "${asmStr}", constraints = "${constraints}", pure = ${isPure}, packed_element = ${pack} : i32}> : (${argTypes}) -> ${outType}`);
+    return tensor(`%${r}`, outShape, outElem);
+  }
+
+  /** Hardware rsqrt via PTX `rsqrt.approx.f32` — no libdevice needed. */
+  rsqrtHw(a: Value): Value {
+    return this.inlineAsm("rsqrt.approx.f32 $0, $1;", "=f, f", [a], a.type.shape, a.elem as ScalarElem);
+  }
   sin(a: Value): Value { return this.math1(a, "sin"); }
   cos(a: Value): Value { return this.math1(a, "cos"); }
   tanh(a: Value): Value { return this.math1(a, "tanh"); }

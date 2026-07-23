@@ -129,8 +129,7 @@ function buildRMS(N:number) {
   const x=b.fpext(b.load(tpX,{boundaryCheck:[0,1],padding:1}),"f32");
   const ms=b.divf(b.sum(b.mul(x,x),1),b.f32(N));
   const msBc=b.broadcast(b.expandDims(ms,1),[1,N]);
-  let yy=b.f32(1);
-  for(let i=0;i<13;i++){const y2=b.mul(yy,yy);yy=b.mul(yy,b.sub(b.f32(1.5),b.mul(b.f32(0.5),b.mul(b.add(msBc,b.f32(EPS)),y2))));}
+  const yy=b.rsqrtHw(b.add(msBc,b.f32(EPS)));
   let y=b.mul(x,yy);
   y=b.mul(y,b.add(b.f32(1),b.fpext(b.load(tpW,{boundaryCheck:[0,1],padding:1}),"f32")));
   b.store(tpY,b.fptrunc(y,"bf16"),{boundaryCheck:[0,1]});
@@ -210,17 +209,17 @@ function buildGDNSeq1() {
   const kConv=b.mul(kW,b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(kW,b.f32(-1))))));
   const vW=b.mul(vRaw,cw3v);
   const vConv=b.mul(vW,b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(vW,b.f32(-1))))));
-  const qRstd=rsqrtNR(b,b.add(b.divf(b.sum(b.mul(qConv,qConv),1),b.f32(LKD)),b.f32(1e-6)));
-  const kRstd=rsqrtNR(b,b.add(b.divf(b.sum(b.mul(kConv,kConv),1),b.f32(LKD)),b.f32(1e-6)));
-  const qNorm=b.mul(qConv,b.mul(qRstd,b.f32(1/LKD)));
-  const kNorm=b.mul(kConv,b.mul(kRstd,b.f32(1/Math.sqrt(LKD))));
+  const qRstd=b.rsqrtHw(b.add(b.sum(b.mul(qConv,qConv),1),b.f32(1e-6)));
+  const kRstd=b.rsqrtHw(b.add(b.sum(b.mul(kConv,kConv),1),b.f32(1e-6)));
+  const qNorm=b.mul(qConv,b.mul(qRstd,b.f32(1/Math.sqrt(LKD))));
+  const kNorm=b.mul(kConv,kRstd);
   const bVal=b.load(b.addptr(b.splatPtr(bP,1,"f32"),head));
   const beta=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(bVal,b.f32(-1)))));
   const qkDot=b.sum(b.mul(qNorm,kNorm),1);
   const delta=b.mul(vConv,beta);
   const o=b.mul(delta,qkDot);
   const oMs=b.divf(b.sum(b.mul(o,o),1),b.f32(LVD));
-  const oRstd=rsqrtNR(b,b.add(oMs,b.f32(EPS)));
+  const oRstd=b.rsqrtHw(b.add(oMs,b.f32(EPS)));
   const oNormed=b.mul(o,oRstd);
   const tpNW=b.makeTensorPtr(NormW,[1,LVD],[LVD,1],[b.i32(0),b.i32(0)],[1,LVD],"f32",[1,0]);
   const nw=b.load(tpNW,{boundaryCheck:[0,1],padding:1});
