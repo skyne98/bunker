@@ -237,3 +237,53 @@ These primitives had never been exercised by a passing test:
 GQA Q-block tiling, **split-KV parallel-tiled-softmax decode** (3D grid + a
 reduction kernel), decoupled tile sizes, and heuristic-tuned configs — taking
 the naive 19.7% → ~106% of FlashAttention-3.
+
+## fa2_vllm.ts — optimized FA2 (multi-head GQA + two-stage causal split)
+
+The optimized port, in the style of vLLM's `triton_unified_attention` / IBM's
+"Anatomy of a Triton Attention Kernel", layered on the clean `fa2_clean.ts`.
+
+```bash
+bun run prototypes/fa2_vllm.ts
+# env knobs for tuning: BM=64 BN=64 WARPS=4 STAGES=3  (the winning config)
+```
+
+**Result (RTX 3090, causal, 8 q-heads / 2 kv-heads GQA, D=128):**
+
+| port | config | throughput | vs clean |
+|---|---|---|---|
+| fa2_clean (1 head) | BM=128 BN=64 W=8 | 4.23 TFLOPS | 1× |
+| fa2_vllm (8h GQA) | BM=128 BN=64 W=4 | 10.6 TFLOPS | 2.5× |
+| **fa2_vllm (8h GQA)** | **BM=64 BN=64 W=4 S=3** | **~29.5 TFLOPS** | **7×** |
+
+~29.5 TFLOPS is **~42% of the 3090's 71 TFLOPS f16 peak** (max err 0.0002). A
+hand-written port with no autotuner; real FA2 libs reach ~50–65% with full
+autotuning + flash stage tricks.
+
+### The three optimizations (and the one that mattered most)
+1. **Multi-head GQA grid** `[num_q_blocks, num_q_heads]` — THE fix. The clean
+   port's grid `[M/BM, 1]` launched only 16 programs on 82 SMs (severe
+   under-occupancy — that alone capped it at ~4 TFLOPS). Gridding over the 8
+   q-heads gives 8× more programs and saturates the SMs. Each q-head derives
+   `kv_head = q_head // G` (correct GQA).
+2. **Two-stage causal split** (FA2 work partitioning): STAGE 1 loops K-tiles
+   `[0, m·BM)` **unmasked** (all-valid lower triangle — skips the ~half of
+   tiles the clean port masked to -inf and processed for nothing); STAGE 2 does
+   just the diagonal `[m·BM, (m+1)·BM)` with the mask. ~halves causal work.
+3. **Tile/warp tuning**: BM=64/BN=64/4 warps/stages=3 beat BM=128 (smaller tiles
+   → more programs → better occupancy on this problem size). `num_stages`
+   pipelining was added to the builder (`build(name, warps, stages)`) but had
+   little effect here — occupancy was the binding constraint, not pipelining.
+
+### Not yet ported (the decode-oriented vLLM opts)
+These matter most at `BLOCK_M=1` (decode), where prefill-style tiling
+underutilizes the GPU — exactly Qwen3.5's steady-state inference regime:
+- **GQA Q-block KV reuse**: load each KV head once per group of G q-heads (here
+  each q-head program loads its own KV — correct, but reloads the same KV G×).
+- **Split-KV parallel-tiled-softmax decode**: 3D grid
+  `[seqs, kv_heads, segments]` + a reduction kernel — the signature vLLM decode
+  optimization for memory-bound single-token attention.
+
+### Builder addition
+`TTIRBuilder.build(name, numWarps, numStages?)` now emits `ttg.num-stages` for
+software pipelining (read by the shim's pass pipeline).

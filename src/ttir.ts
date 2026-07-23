@@ -948,12 +948,13 @@ export class TTIRBuilder {
   // ───────────────────────────────────────────────────────────────
 
   /** Emit the final TTIR module string. */
-  build(kernelName = "kernel", numWarps = 4): string {
+  build(kernelName = "kernel", numWarps = 4, numStages = 0): string {
     const paramDecls = this.params.map((p, i) =>
       `%arg${i}: ${paramTypeText(p)}`,
     ).join(", ");
+    const stagesAttr = numStages > 0 ? `, "ttg.num-stages" = ${numStages} : i32` : "";
     const header =
-`module attributes {"ttg.num-warps" = ${numWarps} : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+`module attributes {"ttg.num-warps" = ${numWarps} : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32${stagesAttr}} {
   tt.func @${kernelName}(${paramDecls}) {`;
     const footer = `\n    tt.return\n  }\n}\n`;
     return header + "\n" + this.lines.join("\n") + footer;
