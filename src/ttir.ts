@@ -422,6 +422,25 @@ export class TTIRBuilder {
     return tensor(`%${r}`, shape, outElem);
   }
 
+  /**
+   * Broadcast a value (scalar or any tensor) to `targetShape`.
+   * Handles: scalar → splat, [128]→reshape[1,128]→broadcast, [1]→[1,1]→broadcast, etc.
+   */
+  broadcastTo(a: Value, targetShape: number[]): Value {
+    if (a.type.shape.join("x") === targetShape.join("x")) return a;
+    // Scalar → splat directly
+    if (a.isScalar) return this.splat(a, targetShape, a.elem as ScalarElem);
+    // Pad with leading 1s to match target rank
+    if (a.rank < targetShape.length) {
+      const padShape = new Array(targetShape.length - a.rank).fill(1).concat(a.type.shape);
+      a = this.reshape(a, padShape);
+    }
+    // Check broadcastable: each dim must be 1 or equal
+    const canBroadcast = a.type.shape.every((d, i) => d === 1 || d === targetShape[i]);
+    if (!canBroadcast) throw new Error(`broadcastTo: cannot broadcast ${a.type.shape} to ${targetShape}`);
+    return this.broadcast(a, targetShape);
+  }
+
   /** `tt.get_program_id` along axis (0=x, 1=y, 2=z). */
   programId(axis: 0 | 1 | 2 = 0): Value {
     const dim = axis === 0 ? "x" : axis === 1 ? "y" : "z";
@@ -530,8 +549,11 @@ export class TTIRBuilder {
   /** `tt.addptr` — elementwise pointer+offset for pointer-tensor style. */
   addptr(ptrs: Value, offsets: Value): Value {
     if (!isPtr(ptrs.type.elem)) throw new Error(`addptr: expected pointer tensor`);
+    // Auto-broadcast scalar or [1] offsets to match pointer-tensor shape
+    if (offsets.isScalar) offsets = this.splat(offsets, ptrs.type.shape, "i32");
+    else if (offsets.type.shape.join("x") !== ptrs.type.shape.join("x"))
+      offsets = this.broadcastTo(offsets, ptrs.type.shape);
     const r = this.fresh("ap");
-    const n = ptrs.type.shape[0];
     this.emit(`%${r} = tt.addptr ${ptrs.name}, ${offsets.name} : ${typeText(ptrs.type)}, ${typeText(offsets.type)}`);
     return new Value(`%${r}`, ptrs.type);
   }
@@ -549,9 +571,17 @@ export class TTIRBuilder {
   // ───────────────────────────────────────────────────────────────
 
   private elemwise2(a: Value, b: Value, op: string, floatOp: string): Value {
-    // Auto-splat a scalar operand to the other's shape (pleasant broadcasting).
-    if (a.isScalar && !b.isScalar) a = this.splat(a, b.type.shape, a.elem as ScalarElem);
-    else if (b.isScalar && !a.isScalar) b = this.splat(b, a.type.shape, b.elem as ScalarElem);
+    // Auto-broadcast: scalar or singleton ([1], [1,1], …) operands match any shape.
+    if (a.type.shape.join("x") !== b.type.shape.join("x")) {
+      const aSingleton = a.isScalar || a.type.shape.every(d => d === 1);
+      const bSingleton = b.isScalar || b.type.shape.every(d => d === 1);
+      if (aSingleton && bSingleton) {
+        // Both singletons — broadcast the lower-rank one up
+        if (a.rank <= b.rank) a = this.broadcastTo(a, b.type.shape);
+        else b = this.broadcastTo(b, a.type.shape);
+      } else if (aSingleton) a = this.broadcastTo(a, b.type.shape);
+      else if (bSingleton) b = this.broadcastTo(b, a.type.shape);
+    }
     if (a.type.shape.join("x") !== b.type.shape.join("x"))
       throw new Error(`${op}: shape mismatch ${a.type.shape} vs ${b.type.shape}`);
     const e = a.elem;
@@ -615,8 +645,15 @@ export class TTIRBuilder {
   // ───────────────────────────────────────────────────────────────
 
   private cmp(a: Value, b: Value, intPred: string, floatPred: string): Value {
-    if (a.isScalar && !b.isScalar) a = this.splat(a, b.type.shape, a.elem as ScalarElem);
-    else if (b.isScalar && !a.isScalar) b = this.splat(b, a.type.shape, b.elem as ScalarElem);
+    if (a.type.shape.join("x") !== b.type.shape.join("x")) {
+      const aSingleton = a.isScalar || a.type.shape.every(d => d === 1);
+      const bSingleton = b.isScalar || b.type.shape.every(d => d === 1);
+      if (aSingleton && bSingleton) {
+        if (a.rank <= b.rank) a = this.broadcastTo(a, b.type.shape);
+        else b = this.broadcastTo(b, a.type.shape);
+      } else if (aSingleton) a = this.broadcastTo(a, b.type.shape);
+      else if (bSingleton) b = this.broadcastTo(b, a.type.shape);
+    }
     const isF = isFloat(a.elem);
     const pred = isF ? floatPred : intPred;
     const r = this.fresh("cmp");

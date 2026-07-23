@@ -64,7 +64,7 @@ function buildRMS(N:number) {
   const ms=b.divf(b.sum(b.mul(x,x),1),b.f32(N));
   const msBc=b.broadcast(b.expandDims(ms,1),[1,N]);
   let yy=b.f32(1);
-  for(let i=0;i<6;i++){const y2=b.mul(yy,yy);yy=b.mul(yy,b.sub(b.f32(1.5),b.mul(b.f32(0.5),b.mul(b.add(msBc,b.f32(EPS)),y2))));}
+  for(let i=0;i<13;i++){const y2=b.mul(yy,yy);yy=b.mul(yy,b.sub(b.f32(1.5),b.mul(b.f32(0.5),b.mul(b.add(msBc,b.f32(EPS)),y2))));}
   let y=b.mul(x,yy);
   y=b.mul(y,b.add(b.f32(1),b.fpext(b.load(tpW,{boundaryCheck:[0,1],padding:1}),"f32")));
   b.store(tpY,b.fptrunc(y,"bf16"),{boundaryCheck:[0,1]});
@@ -76,9 +76,9 @@ function buildSwiGLU(N:number) {
   const row=b.programId(0);
   const BLK=Math.min(1024,N);
   const off=b.mul(row,b.i32(BLK));
-  const tpG=b.makeTensorPtr(G,[1,N],[N,1],[off,b.i32(0)],[1,BLK],"f32",[1,0]);
-  const tpU=b.makeTensorPtr(U,[1,N],[N,1],[off,b.i32(0)],[1,BLK],"f32",[1,0]);
-  const tpO=b.makeTensorPtr(O,[1,N],[N,1],[off,b.i32(0)],[1,BLK],"bf16",[1,0]);
+  const tpG=b.makeTensorPtr(G,[1,N],[N,1],[b.i32(0),off],[1,BLK],"f32",[1,0]);
+  const tpU=b.makeTensorPtr(U,[1,N],[N,1],[b.i32(0),off],[1,BLK],"f32",[1,0]);
+  const tpO=b.makeTensorPtr(O,[1,N],[N,1],[b.i32(0),off],[1,BLK],"bf16",[1,0]);
   const g=b.load(tpG,{boundaryCheck:[0,1],padding:1});
   const u=b.load(tpU,{boundaryCheck:[0,1],padding:1});
   const sig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(g,b.f32(-1)))));
@@ -91,9 +91,9 @@ function buildAdd(N:number) {
   const row=b.programId(0);
   const BLK=Math.min(1024,N);
   const off=b.mul(row,b.i32(BLK));
-  const tpA=b.makeTensorPtr(A,[1,N],[N,1],[off,b.i32(0)],[1,BLK],"bf16",[1,0]);
-  const tpB=b.makeTensorPtr(B,[1,N],[N,1],[off,b.i32(0)],[1,BLK],"bf16",[1,0]);
-  const tpO=b.makeTensorPtr(O,[1,N],[N,1],[off,b.i32(0)],[1,BLK],"bf16",[1,0]);
+  const tpA=b.makeTensorPtr(A,[1,N],[N,1],[b.i32(0),off],[1,BLK],"bf16",[1,0]);
+  const tpB=b.makeTensorPtr(B,[1,N],[N,1],[b.i32(0),off],[1,BLK],"bf16",[1,0]);
+  const tpO=b.makeTensorPtr(O,[1,N],[N,1],[b.i32(0),off],[1,BLK],"bf16",[1,0]);
   const a=b.fpext(b.load(tpA,{boundaryCheck:[0,1],padding:1}),"f32");
   const bb=b.fpext(b.load(tpB,{boundaryCheck:[0,1],padding:1}),"f32");
   b.store(tpO,b.fptrunc(b.add(a,bb),"bf16"),{boundaryCheck:[0,1]});
@@ -105,17 +105,23 @@ function buildCast(N:number) {
   const row=b.programId(0);
   const BLK=Math.min(1024,N);
   const off=b.mul(row,b.i32(BLK));
-  const tpX=b.makeTensorPtr(X,[1,N],[N,1],[off,b.i32(0)],[1,BLK],"f32",[1,0]);
-  const tpY=b.makeTensorPtr(Y,[1,N],[N,1],[off,b.i32(0)],[1,BLK],"bf16",[1,0]);
+  const tpX=b.makeTensorPtr(X,[1,N],[N,1],[b.i32(0),off],[1,BLK],"f32",[1,0]);
+  const tpY=b.makeTensorPtr(Y,[1,N],[N,1],[b.i32(0),off],[1,BLK],"bf16",[1,0]);
   const x=b.load(tpX,{boundaryCheck:[0,1],padding:1});
   b.store(tpY,b.fptrunc(x,"bf16"),{boundaryCheck:[0,1]});
   return b.build("cs",4,3);
 }
 
+// Newton-Raphson rsqrt (avoids libdevice __nv_rsqrtf)
+function rsqrtNR(b: any, x: any): any {
+  let yy=b.f32(1);
+  for(let i=0;i<13;i++){const y2=b.mul(yy,yy);yy=b.mul(yy,b.sub(b.f32(1.5),b.mul(b.f32(0.5),b.mul(x,y2))));}
+  return yy;
+}
+
 // ── GDN linear attention: single-kernel for seq=1 ──
-// Does: conv1d(tap3) + split + L2norm(q,k) + delta_rule(T=1) + RMSNormGated
-// Input: QKV[1, QKVD] bf16, Z[1, ZD] bf16, ConvW[QKVD, 4] bf16, ALog[LVH] f32, dtBias[LVH] bf16, aP[1, LVH] f32, bP[1, LVH] f32, NormW[LVD] f32, Out[1, ZD] bf16
-// Grid: [LVH] — one program per value head (d_k=d_v=128)
+// Grid: [LVH] (16 value heads). Each program handles one head (d_k=d_v=128).
+// Does: conv1d(tap3) + L2norm(q,k) + delta_rule(T=1) + RMSNormGated
 function buildGDNSeq1() {
   const b=new TTIRBuilder();
   const QKV=b.param("QKV",{ptr:"bf16"}),Z=b.param("Z",{ptr:"bf16"}),ConvW=b.param("CW",{ptr:"bf16"});
@@ -123,66 +129,66 @@ function buildGDNSeq1() {
   const NormW=b.param("NW",{ptr:"f32"}),Out=b.param("O",{ptr:"bf16"});
   const head=b.programId(0); // 0..15
 
-  // Load q, k, v for this head from QKV[1, QKVD] = [1, 3*2048]
-  // q = QKV[0, head*128 : (head+1)*128]  (offset head*LKD in QKV, within first 2048)
-  // k = QKV[0, 2048 + head*128 : 2048 + (head+1)*128]
-  // v = QKV[0, 4096 + head*128 : 4096 + (head+1)*128]
   const qOff=b.mul(head,b.i32(LKD));
   const kOff=b.add(b.i32(KEYDIM),qOff);
   const vOff=b.add(b.i32(2*KEYDIM),qOff);
-  // Load conv weight tap 3 for this head's channels: ConvW[head*128 + i, 3] for i=0..127
-  // ConvW is [6144, 1, 4] → flattened [6144, 4] row-major. Tap 3 = ConvW[head*128+i, 3] = ConvW_flat[(head*128+i)*4 + 3]
-  const cwBase=b.mul(b.add(b.mul(head,b.i32(LKD)),b.i32(0)),b.i32(4)); // head*128*4
-  const cwBase2=b.add(b.mul(b.mul(head,b.i32(LKD)),b.i32(4)),b.i32(3));
-  const cwAr2=b.mul(b.arange(0,LKD),b.i32(4));
-  const cwOffs=b.add(cwAr2,cwBase2);
-  const cw3=b.broadcast(b.expandDims(b.fpext(b.load(b.addptr(b.splatPtr(ConvW,LKD,"bf16"),cwOffs)),"f32"),0),[1,LKD]);
-  // Apply conv1d (tap 3 only for seq=1): qkv_silu = silu(w3 * qkv)
+
+  // Load q, k, v for this head from QKV[1, QKVD]
   const tpQ=b.makeTensorPtr(QKV,[1,QKVD],[QKVD,1],[b.i32(0),qOff],[1,LKD],"bf16",[1,0]);
   const tpK=b.makeTensorPtr(QKV,[1,QKVD],[QKVD,1],[b.i32(0),kOff],[1,LKD],"bf16",[1,0]);
   const tpV=b.makeTensorPtr(QKV,[1,QKVD],[QKVD,1],[b.i32(0),vOff],[1,LKD],"bf16",[1,0]);
   const qRaw=b.fpext(b.load(tpQ,{boundaryCheck:[0,1],padding:1}),"f32");
   const kRaw=b.fpext(b.load(tpK,{boundaryCheck:[0,1],padding:1}),"f32");
   const vRaw=b.fpext(b.load(tpV,{boundaryCheck:[0,1],padding:1}),"f32");
-  // Conv1d tap 3: multiply by w[:, 3] and apply silu
-  // Load conv weights: CW[head*128+i, 3] for i=0..127 → pointer arithmetic
-  // Apply: q_silu = silu(w3 * q), k_silu = silu(w3 * k), v_silu = silu(w3 * v)
-  // But wait — conv1d weight is per-channel: CW[head*128+i, 3] applies to channel head*128+i
-  // The q/k/v for this head are at QKV[0, head*128 : head*128+128], which corresponds to channels head*128..head*128+127
-  // So CW[head*128+i, 3] applies to q[i] for i=0..127 ✓
-  const qSig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(b.mul(qRaw,cw3),b.f32(-1))))); // sigmoid(w3*q)
-  const qConv=b.mul(b.mul(qRaw,cw3),qSig); // silu(w3*q) = w3*q*sigmoid(w3*q)
-  const kSig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(b.mul(kRaw,cw3),b.f32(-1)))));
-  const kConv=b.mul(b.mul(kRaw,cw3),kSig);
-  const vSig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(b.mul(vRaw,cw3),b.f32(-1)))));
-  const vConv=b.mul(b.mul(vRaw,cw3),vSig);
-  // L2norm q and k: q = q / ||q||, k = k / ||k|| (then q *= 1/sqrt(d_k))
-  const qRstd=b.broadcast(b.expandDims(b.rsqrt(b.add(b.sum(b.mul(qConv,qConv),1),b.f32(1e-6))),1),[1,LKD]); const qNorm=b.mul(qConv,qRstd);
-  const kRstd=b.broadcast(b.expandDims(b.rsqrt(b.add(b.sum(b.mul(kConv,kConv),1),b.f32(1e-6))),1),[1,LKD]); const kNorm=b.mul(kConv,kRstd);
-  const qScaled=b.mul(qNorm,b.f32(1/Math.sqrt(LKD)));
-  // Delta rule for T=1 (S=0):
-  // beta = sigmoid(bP[head])
-  // delta = v * beta (since k·S = 0)
-  // o = (q·k) * delta = sum(q*k) * (v * beta)
-  const bVal=b.load(b.addptr(b.splatPtr(bP,1,"f32"),b.splat(head,[1],"i32")));
-  const beta=b.broadcast(b.expandDims(b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(bVal,b.f32(-1))))),0),[1,LKD]);
-  const qkDot=b.broadcast(b.expandDims(b.sum(b.mul(qScaled,kNorm),1),1),[1,LKD]);
-  const delta=b.mul(vConv,beta); // [1, 128]
-  const o=b.mul(delta,b.broadcast(b.expandDims(qkDot,1),[1,LKD])); // [1, 128]
+
+  // Conv1d (seq=1: only tap 3 applies): silu(w3 * x) = w3*x * sigmoid(w3*x)
+  // ConvW is [QKVD, 1, 4] → flat [QKVD*4]. For channel i: CW_flat[i*4 + 3]
+  // For this head: channels head*128..head*128+127
+  const cwIdx=b.mul(b.arange(0,LKD),b.i32(4));
+  const cwOffQ=b.add(b.mul(b.mul(head,b.i32(LKD)),b.i32(4)),b.i32(3));
+  const cwOffK=b.add(b.mul(b.add(b.i32(KEYDIM),b.mul(head,b.i32(LKD))),b.i32(4)),b.i32(3));
+  const cwOffV=b.add(b.mul(b.add(b.i32(2*KEYDIM),b.mul(head,b.i32(LKD))),b.i32(4)),b.i32(3));
+  const cw3q=b.broadcastTo(b.fpext(b.load(b.addptr(b.splatPtr(ConvW,LKD,"bf16"),b.add(cwIdx,cwOffQ))),"f32"),[1,LKD]);
+  const cw3k=b.broadcastTo(b.fpext(b.load(b.addptr(b.splatPtr(ConvW,LKD,"bf16"),b.add(cwIdx,cwOffK))),"f32"),[1,LKD]);
+  const cw3v=b.broadcastTo(b.fpext(b.load(b.addptr(b.splatPtr(ConvW,LKD,"bf16"),b.add(cwIdx,cwOffV))),"f32"),[1,LKD]);
+  const qW=b.mul(qRaw,cw3q);
+  const qConv=b.mul(qW,b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(qW,b.f32(-1))))));
+  const kW=b.mul(kRaw,cw3k);
+  const kConv=b.mul(kW,b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(kW,b.f32(-1))))));
+  const vW=b.mul(vRaw,cw3v);
+  const vConv=b.mul(vW,b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(vW,b.f32(-1))))));
+
+  // L2norm: q /= ||q||, k /= ||k||, q *= 1/sqrt(d_k)
+  const qRstd=rsqrtNR(b,b.add(b.divf(b.sum(b.mul(qConv,qConv),1),b.f32(LKD)),b.f32(1e-6)));
+  const kRstd=rsqrtNR(b,b.add(b.divf(b.sum(b.mul(kConv,kConv),1),b.f32(LKD)),b.f32(1e-6)));
+  const qNorm=b.mul(qConv,b.mul(qRstd,b.f32(1/LKD)));
+  const kNorm=b.mul(kConv,b.mul(kRstd,b.f32(1/Math.sqrt(LKD))));
+
+  // Delta rule for T=1 (state S=0):
+  //   beta = sigmoid(bP[head])
+  //   delta = v * beta   (k·S = 0)
+  //   o = (q·k) * delta
+  const bVal=b.load(b.addptr(b.splatPtr(bP,1,"f32"),head));
+  const beta=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(bVal,b.f32(-1)))));
+  const qkDot=b.sum(b.mul(qNorm,kNorm),1); // [1]
+  const delta=b.mul(vConv,beta);            // [1,128] (beta auto-broadcasts)
+  const o=b.mul(delta,qkDot);               // [1,128] (qkDot auto-broadcasts)
+
   // RMSNormGated: norm(o) * silu(z)
   const oMs=b.divf(b.sum(b.mul(o,o),1),b.f32(LVD));
-  const oRstd=b.broadcast(b.expandDims(b.rsqrt(b.add(oMs,b.f32(EPS))),1),[1,LVD]);
+  const oRstd=rsqrtNR(b,b.add(oMs,b.f32(EPS)));
   const oNormed=b.mul(o,oRstd);
-  // Load norm weight for this head: NormW[head*128 : head*128+128]
-  const tpNW=b.makeTensorPtr(NormW,[1,LVD],[LVD,1],[b.i32(0),qOff],[1,LVD],"f32",[1,0]);
+  // Norm weight: NormW[head*128 : head*128+128]
+  const tpNW=b.makeTensorPtr(NormW,[1,LVD],[LVD,1],[b.i32(0),b.i32(0)],[1,LVD],"f32",[1,0]);
   const nw=b.load(tpNW,{boundaryCheck:[0,1],padding:1});
   const oWeighted=b.mul(oNormed,nw);
-  // Load z for this head: Z[0, head*128 : head*128+128]
+  // z gate: silu(z[head*128 : head*128+128])
   const tpZ=b.makeTensorPtr(Z,[1,ZD],[ZD,1],[b.i32(0),qOff],[1,LVD],"bf16",[1,0]);
   const zVal=b.fpext(b.load(tpZ,{boundaryCheck:[0,1],padding:1}),"f32");
-  const zSig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(zVal,b.f32(-1)))));
+  // silu(z) = z * sigmoid(z)  — NOT just sigmoid(z)!
+  const zSig=b.mul(zVal,b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(zVal,b.f32(-1))))));
   const oGated=b.mul(oWeighted,zSig);
-  // Store output: Out[0, head*128 : head*128+128]
+  // Store: Out[0, head*128 : head*128+128]
   const tpO=b.makeTensorPtr(Out,[1,ZD],[ZD,1],[b.i32(0),qOff],[1,LVD],"bf16",[1,0]);
   b.store(tpO,b.fptrunc(oGated,"bf16"),{boundaryCheck:[0,1]});
   return b.build("gdn1",4,3);
@@ -215,8 +221,10 @@ const kRms=compileAndLoad(buildRMS(H),"rms",4);
 const kSg=compileAndLoad(buildSwiGLU(INTER),"sg",4);
 const kAd=compileAndLoad(buildAdd(H),"ad",4);
 const kCs=compileAndLoad(buildCast(H),"cs",4);
+const kCsQKV=compileAndLoad(buildCast(QKVD),"cs",4);
+const kCsZD=compileAndLoad(buildCast(ZD),"cs",4);
 const kGDN1=compileAndLoad(buildGDNSeq1(),"gdn1",4);
-console.log(`compiled ${12} kernels in ${((performance.now()-t0)/1000).toFixed(1)}s`);
+console.log(`compiled ${14} kernels in ${((performance.now()-t0)/1000).toFixed(1)}s`);
 
 // embed
 console.log("embedding...");
@@ -249,8 +257,7 @@ for(let layer=0;layer<NL;layer++){
   let attnF32=cuAlloc(BigInt(seq*H*4));
 
   if(!full){
-    // Linear attention (GatedDeltaNet) — wired for seq=1
-    // Projections
+    // ── Linear attention (GatedDeltaNet) — seq=1 optimized ──
     const qkv=cuAlloc(BigInt(seq*QKVD*4));
     launch(kQKV,[Math.ceil(seq/64),Math.ceil(QKVD/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_qkv.weight"),qkv],`qkv.L${layer}`);
     const z=cuAlloc(BigInt(seq*ZD*4));
@@ -259,23 +266,21 @@ for(let layer=0;layer<NL;layer++){
     launch(kA,[Math.ceil(seq/64),Math.ceil(LVH/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_a.weight"),aP],`a.L${layer}`);
     const bP=cuAlloc(BigInt(seq*LVH*4));
     launch(kB,[Math.ceil(seq/64),Math.ceil(LVH/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_b.weight"),bP],`b.L${layer}`);
-    // Cast qkv, z to bf16
+    if(layer===0){
+      const hBP=new Float32Array(LVH);
+      cuDtoH(hBP.buffer,bP,BigInt(LVH*4));
+      console.log(`    [debug] bP L0: [${hBP.slice(0,16).map(v=>v.toFixed(4)).join(",")}]`);
+      const hAP=new Float32Array(LVH);
+      cuDtoH(hAP.buffer,aP,BigInt(LVH*4));
+      console.log(`    [debug] aP L0: [${hAP.slice(0,16).map(v=>v.toFixed(4)).join(",")}]`);
+    }
+    // Cast qkv, z → bf16
     const qkvB=cuAlloc(BigInt(seq*QKVD*2));
-    // Need a cast for QKVD — compile one or reuse kCs with different N
-    // Actually kCs was compiled for H=1024. Need a cast for QKVD=6144 and ZD=2048.
-    // Let's just cast manually with a simple approach: use the GDN kernel which takes bf16 input
-    // The GDN kernel needs bf16 QKV, bf16 Z, f32 ALog, bf16 dtBias, f32 aP, f32 bP, f32 NormW
-    // We have f32 qkv, f32 z, f32 aP, f32 bP. Need to cast qkv and z to bf16.
-    // For now: the GDN kernel can be adapted to take f32 input. Let me change the buildGDNSeq1 to take f32 QKV and Z.
-    // Actually, let me just pass the f32 pointers and adjust the kernel.
-    // Simpler: compile cast kernels for QKVD and ZD.
-    const kCsQKV=compileAndLoad(buildCast(QKVD),"csQ",4);
-    const kCsZD=compileAndLoad(buildCast(ZD),"csZ",4);
-    launch(kCsQKV,[BLK1(seq*QKVD),1,1],[128,1,1],[qkv,qkvB],`csQKV.L${layer}`);
+    launch(kCsQKV,[BLK1(seq*QKVD),1,1],[128,1,1],[qkv,qkvB],`csQ.L${layer}`);
     const zB=cuAlloc(BigInt(seq*ZD*2));
     launch(kCsZD,[BLK1(seq*ZD),1,1],[128,1,1],[z,zB],`csZ.L${layer}`);
     cuFree(qkv);cuFree(z);
-    // GDN kernel: takes bf16 QKV, bf16 Z, bf16 ConvW, f32 ALog, bf16 dtBias, f32 aP, f32 bP, f32 NormW → bf16 Out
+    // GDN kernel
     const gdnOut=cuAlloc(BigInt(seq*ZD*2));
     launch(kGDN1,[LVH,1,1],[128,1,1],[
       qkvB, zB,
@@ -289,11 +294,19 @@ for(let layer=0;layer<NL;layer++){
     cuFree(qkvB);cuFree(zB);cuFree(aP);cuFree(bP);
     // out_proj: [seq, H] = gdnOut[seq, ZD] @ W[H, ZD]
     launch(kOutProj,[Math.ceil(seq/64),Math.ceil(H/64),1],[128,1,1],[gdnOut,wp(W,layer,"linear_attn.out_proj.weight"),attnF32],`op.L${layer}`);
+    if(layer===0){
+      const dbg=new Uint16Array(ZD);
+      cuDtoH(dbg.buffer,gdnOut,BigInt(ZD*2));
+      const tmp=new ArrayBuffer(4);const u8=new Uint8Array(tmp);const f32=new Float32Array(tmp);
+      let nz=0,mx=0;
+      for(let i=0;i<ZD;i++){u8[2]=dbg[i]&0xFF;u8[3]=dbg[i]>>8;if(f32[0]!==0)nz++;if(Math.abs(f32[0])>mx)mx=Math.abs(f32[0]);}
+      console.log(`    [debug] GDN L0: ${nz}/${ZD} non-zero, max=${mx.toFixed(6)}`);
+    }
     cuFree(gdnOut);
     if(layer<4)console.log(`  layer ${layer} (linear): GDN+out_proj`);
   } else {
-    // Full attention — still placeholder (identity)
-    if(layer<8)console.log(`  layer ${layer} (full): FA2 placeholder (identity)`);
+    // Full attention — placeholder (identity)
+    if(layer>=NL-2)console.log(`  layer ${layer} (full): FA2 placeholder`);
   }
 
   // 3. cast + residual

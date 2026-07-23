@@ -553,6 +553,7 @@ name = "gigatoken_wrapper"
 version = "0.1.0"
 dependencies = [
  "gigatoken",
+ "rayon",
 ]
 
 [[package]]
