@@ -387,3 +387,37 @@ requires **FA3-style warp specialization** (producer/consumer warps that
 overlap softmax with matmul) — which needs **Hopper+ (TMA + wgmma async)** and
 is **not available on the 3090 (sm_86, Ampere)**. So ~60 TFLOPS at long context
 is near the FA2 ceiling on this GPU; FA3 would be the path on Hopper/Blackwell.
+
+## rmsnorm.ts — RMSNorm (GemmaRMSNorm, Qwen3.5) at peak HBM bandwidth
+
+Ported from the production-fast Liger-Kernel `_rms_norm_forward_kernel`
+(the canonical fast Triton RMSNorm) + Triton's 05-layer-norm tutorial.
+Qwen3.5 uses GemmaRMSNorm: `y = x · rsqrt(mean(x²) + ε) · (1 + weight)`, ε=1e-6.
+
+```bash
+bun run prototypes/rmsnorm.ts           # Newton rsqrt (no libdevice)
+NATIVE=1 bun run prototypes/rmsnorm.ts  # try native math.rsqrt (needs shim rebuild)
+```
+
+**Result (RTX 3090, 512×1024):**
+- correct: **max err 3.58e-7** vs host reference
+- throughput: **935 GB/s effective memory bandwidth** — **~100% of the 3090's
+  936 GB/s HBM peak** (RMSNorm is memory-bound; one program per row, full row
+  in a 1D tile).
+
+### The rsqrt question (libdevice)
+RMSNorm's only non-elementwise op is `rsqrt`. Two paths:
+- **Native `math.rsqrt`** → lowers to libdevice `__nv_rsqrtf` → **fails at ptxas**
+  ("Unresolved extern `__nv_rsqrtf`") because the shim doesn't link libdevice.
+  (`libdevice.10.bc` IS now present in the nix store, so a shim rebuild would
+  unblock it — see `shim/build_shim.sh`.)
+- **Newton-Raphson `rsqrt`** (`y ← y·(1.5 − 0.5·a·y²)`, 6 iters) — pure
+  `mul`/`sub`, **no libdevice, no rebuild**. Used here. Since RMSNorm is
+  memory-bound (not compute-bound on rsqrt), there is **zero performance cost**
+  vs native — we still hit peak HBM bandwidth.
+
+This Newton trick also unblocks `rsqrt` everywhere else without a shim rebuild:
+GatedDeltaNet's L2-normalization of q/k will use the same approach.
+
+### Builder note
+`tt.load`'s `padding` attribute only allows `1` (zero-pad) or `2` (NaN), not `0`.
