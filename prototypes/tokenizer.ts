@@ -1,139 +1,67 @@
-// prototypes/tokenizer.ts — multi-threaded BPE tokenizer (persistent Bun Workers).
-//
+// prototypes/tokenizer.ts — multi-threaded BPE tokenizer (postMessage + SharedArrayBuffer).
 // bun run prototypes/tokenizer.ts
 import { BPETokenizer } from "./tokenizer_lib";
-
-const STRIDE = 400;
-function makeTestVocab() {
-  const mergeIds = new Uint32Array(400 * STRIDE);
-  const mergeRanks = new Uint32Array(400 * STRIDE).fill(0xFFFFFFFF);
-  const byteToId = new Int32Array(256);
-  for (let i = 0; i < 256; i++) byteToId[i] = i;
-  const pairs: [string, string][] = [
-    ["t","h"],["h","e"],["i","n"],["e","r"],["a","n"],["r","e"],["o","n"],["a","t"],["e","n"],["n","d"],
-    ["t","i"],["e","s"],["o","r"],["t","e"],["o","f"],["e","d"],["i","s"],["i","t"],["a","l"],["a","r"],
-    ["s","t"],["t","o"],["i","n","g"],["a","n","d"],["t","h","e"],["f","o","r"],["a","r","e"],["b","u","t"],
-    ["n","o","t"],["y","o","u"],["a","l","l"],["c","a","n"],["h","e","r"],["w","a","s"],["o","n","e"],
-    ["o","u","r"],["o","u","t"],["d","a","y"],["g","e","t"],["h","a","s"],["h","i","m"],["h","i","s"],
-    ["h","o","w"],["i","t","s"],["m","a","y"],["n","e","w"],["n","o","w"],["o","l","d"],["s","e","e"],
-    ["w","a","y"],["w","h","o"],["d","i","d"],["g","o","t"],["l","e","t"],["s","a","y"],["s","h","e"],
-    ["t","o","o"],["u","s","e"],["e","r","e"],["i","o","n"],["e","n","t"],["t","e","r"],["e","s","t"],
-    ["a","t","i"],["h","a","t"],["c","o","n"],["t","e","d"],["d","e","r"],["p","e","r"],
-    ["t","h","r"],["t","r","a"],["n","c","e"],["m","e","n"],["i","v","e"],["p","r","e"],["o","v","e"],
-  ];
-  let nextId = 256, rank = 1;
-  for (const pair of pairs) {
-    let ids: number[] = [];
-    for (const ch of pair) ids.push(ch.charCodeAt(0));
-    for (let step = 0; step < pair.length - 1; step++) {
-      const key = ids[0] * STRIDE + ids[1];
-      mergeIds[key] = nextId; mergeRanks[key] = rank++; ids = [nextId++, ...ids.slice(2)];
-    }
-  }
-  return { mergeIds, mergeRanks, byteToId };
-}
-
-const { mergeIds, mergeRanks, byteToId } = makeTestVocab();
-const stTokenizer = new BPETokenizer(mergeIds, mergeRanks, STRIDE, byteToId);
-
-// ── persistent worker pool ────────────────────────────────────────────
-const NUM_WORKERS = 32;
+const S = 400;
+const mI = new Uint32Array(400*S), mR = new Uint32Array(400*S).fill(0xFFFFFFFF), bI = new Int32Array(256);
+for (let i=0;i<256;i++) bI[i]=i; mR[116*S+104]=1; mI[116*S+104]=256;
+const ms=new SharedArrayBuffer(mI.byteLength), rs=new SharedArrayBuffer(mR.byteLength), bs=new SharedArrayBuffer(bI.byteLength);
+new Uint32Array(ms).set(mI); new Uint32Array(rs).set(mR); new Int32Array(bs).set(bI);
+const st = new BPETokenizer(mI, mR, S, bI);
+const NUM = 16;
 const workers: Worker[] = [];
-const workerBusy: boolean[] = new Array(NUM_WORKERS).fill(false);
+for (let i=0;i<NUM;i++) workers.push(new Worker(new URL("./tokenizer_worker.ts", import.meta.url)));
+await Promise.all(workers.map((w,i) => new Promise<void>(r => {
+  const h = (e:MessageEvent) => { if (e.data.ready) { w.removeEventListener("message",h); r(); } };
+  w.addEventListener("message", h);
+  w.postMessage({setup:true, mergeSab:ms, mergeRanksSab:rs, byteToIdSab:bs, stride:S});
+})));
+console.log(`${NUM} workers ready (postMessage + SAB)`);
 
-async function initWorkers() {
-  const readyPromises: Promise<void>[] = [];
-  for (let i = 0; i < NUM_WORKERS; i++) {
-    const w = new Worker(new URL("./tokenizer_worker.ts", import.meta.url));
-    workers.push(w);
-    readyPromises.push(new Promise<void>((resolve) => {
-      const h = (e: MessageEvent) => { if (e.data.ready) { w.removeEventListener("message", h); resolve(); } };
-      w.addEventListener("message", h);
-      // copy merge tables (each worker gets its own copy)
-      w.postMessage({
-        setup: true,
-        mergeIds: new Uint32Array(mergeIds),
-        mergeRanks: new Uint32Array(mergeRanks),
-        byteToId: new Int32Array(byteToId),
-        stride: STRIDE,
-      });
-    }));
-  }
-  await Promise.all(readyPromises);
-}
-
-function splitChunks(bytes: Uint8Array, n: number): Uint8Array[] {
-  const cs = Math.ceil(bytes.length / n);
-  const chunks: Uint8Array[] = [];
-  for (let i = 0; i < n; i++) {
-    let start = i * cs, end = Math.min((i + 1) * cs, bytes.length);
-    if (i > 0) while (start < end && bytes[start] === 32) start++;
-    if (i < n - 1) while (end < bytes.length && bytes[end] !== 32) end++;
-    chunks.push(bytes.subarray(start, end));
-  }
-  return chunks;
-}
-
+let _sab: SharedArrayBuffer | null = null;
 async function encodeMT(bytes: Uint8Array): Promise<number[]> {
-  const chunks = splitChunks(bytes, NUM_WORKERS);
-  const results: Int32Array[] = new Array(NUM_WORKERS);
-  const promises: Promise<void>[] = [];
-  for (let i = 0; i < NUM_WORKERS; i++) {
+  const textLen = bytes.length;
+  const outOff = (textLen + 3) & ~3;
+  const chunkMax = Math.ceil((textLen / NUM) * 2 * 4) + 64;
+  const sabSize = outOff + NUM * chunkMax;
+  if (!_sab || _sab.byteLength < sabSize) _sab = new SharedArrayBuffer(sabSize);
+  const sab = _sab;
+  new Uint8Array(sab, 0, textLen).set(bytes);
+  const cs = Math.ceil(textLen / NUM);
+  const promises: Promise<number>[] = [];
+  const chunkInfo: {outOff:number}[] = [];
+  for (let i = 0; i < NUM; i++) {
+    let s=i*cs, e=Math.min((i+1)*cs, textLen);
+    if (i > 0) while (s < e && bytes[s] === 32) s++;
+    if (i < NUM-1) while (e < textLen && bytes[e] !== 32) e++;
+    const len = e - s;
+    const outBase = outOff + i * chunkMax;
+    chunkInfo.push({outOff: outBase});
     const idx = i;
-    promises.push(new Promise<void>((resolve) => {
-      const h = (e: MessageEvent) => {
-        if (e.data.ids) { workers[idx].removeEventListener("message", h); results[idx] = e.data.ids; resolve(); }
-      };
+    promises.push(new Promise<number>(resolve => {
+      const h = (e: MessageEvent) => { if (e.data.done) { workers[idx].removeEventListener("message", h); resolve(e.data.count); } };
       workers[idx].addEventListener("message", h);
-      const buf = new Uint8Array(chunks[idx].length);
-      buf.set(chunks[idx]);
-      workers[idx].postMessage({ work: true, bytes: buf }, [buf.buffer]);
+      workers[idx].postMessage({encode:true, sab, inputOff:s, inputLen:len, outputOff:outBase, outputLen:Math.ceil(len*2)});
     }));
   }
-  await Promise.all(promises);
-  const allIds: number[] = [];
-  for (const r of results) for (let i = 0; i < r.length; i++) allIds.push(r[i]);
-  return allIds;
+  const counts = await Promise.all(promises);
+  const ids: number[] = [];
+  for (let i = 0; i < NUM; i++) {
+    const c = counts[i];
+    if (c > 0) { const arr = new Int32Array(sab, chunkInfo[i].outOff, c); for (let j=0;j<c;j++) ids.push(arr[j]); }
+  }
+  return ids;
 }
 
-// ── generate text ────────────────────────────────────────────────────
 const words = ["the","quick","brown","fox","jumps","over","lazy","dog","hello","world","this","is","a","test","of","the","tokenizer","running","at","high","speed","with","many","words","and","some","numbers","like","123","and","456","plus","punctuation!","The","END"];
 let text = "";
-while (text.length < 40_000_000) text += words[Math.floor(Math.random() * words.length)] + " ";
+while (text.length < 40_000_000) text += words[Math.floor(Math.random()*words.length)] + " ";
 text = text.substring(0, 40_000_000);
 const textBytes = new TextEncoder().encode(text);
-console.log(`text: ${(textBytes.length / 1e6).toFixed(1)} MB, ${NUM_WORKERS} workers`);
+console.log(`text: ${(textBytes.length/1e6).toFixed(1)} MB`);
 
-// ── init workers ─────────────────────────────────────────────────────
-console.log("initializing workers...");
-await initWorkers();
-console.log("workers ready");
-
-// correctness
-const stIds = stTokenizer.encode("the quick brown fox");
-console.log(`ST: ${stIds.length} tokens`);
-const mtIds = await encodeMT(new TextEncoder().encode("the quick brown fox"));
-console.log(`MT: ${mtIds.length} tokens`);
-
-// warmup
-stTokenizer.encode(text.substring(0, 100000));
 await encodeMT(textBytes.subarray(0, 100000));
+st.encode(text.substring(0, 100000));
 
-// ST bench
-{
-  const t0 = performance.now(); const it = 3;
-  for (let i = 0; i < it; i++) stTokenizer.encode(text);
-  const dt = (performance.now() - t0) / 1000 / it;
-  console.log(`single-threaded: ${(dt*1e3).toFixed(0)} ms, ${(text.length/dt/1e9).toFixed(2)} GB/s`);
-}
-// MT bench
-{
-  const t0 = performance.now(); const it = 3;
-  for (let i = 0; i < it; i++) await encodeMT(textBytes);
-  const dt = (performance.now() - t0) / 1000 / it;
-  const toks = (await encodeMT(textBytes)).length;
-  console.log(`multi-threaded (${NUM_WORKERS} workers): ${(dt*1e3).toFixed(0)} ms, ${(text.length/dt/1e9).toFixed(2)} GB/s, ${toks} tokens`);
-}
-
-// terminate
-for (const w of workers) w.terminate();
+{ const t0=performance.now(),it=3; for(let i=0;i<it;i++) st.encode(text); const dt=(performance.now()-t0)/1000/it; console.log(`ST: ${(dt*1e3).toFixed(0)}ms ${(text.length/dt/1e9).toFixed(2)}GB/s`); }
+{ const t0=performance.now(),it=5; for(let i=0;i<it;i++) await encodeMT(textBytes); const dt=(performance.now()-t0)/1000/it; const toks=(await encodeMT(textBytes)).length; console.log(`MT(${NUM}w,SAB): ${(dt*1e3).toFixed(0)}ms ${(text.length/dt/1e9).toFixed(2)}GB/s ${toks} tokens`); }
+for(const w of workers) w.terminate();

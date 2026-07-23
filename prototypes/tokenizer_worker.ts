@@ -1,11 +1,4 @@
-// prototypes/tokenizer_worker.ts — Bun Worker for parallel BPE tokenization.
-// Receives merge tables (setup) + text chunks (work), returns token IDs.
-//
-// Protocol:
-//   { setup: true, mergeIds, mergeRanks, byteToId, stride }  → init
-//   { work: true, bytes: Uint8Array }                          → encode, return { ids: Int32Array }
-
-// ── 256-byte character classification ────────────────────────────────
+// Worker: postMessage-based, reads from SharedArrayBuffer (zero-copy data).
 const CLS = new Uint8Array(256);
 for (let i = 0; i < 256; i++) {
   if (i === 32 || i === 9 || i === 10 || i === 13 || i === 11 || i === 12) CLS[i] = 0;
@@ -15,76 +8,37 @@ for (let i = 0; i < 256; i++) {
   else CLS[i] = 4;
 }
 for (let i = 0xC0; i < 0x100; i++) CLS[i] = 2;
-
-// ── pre-tokenizer ────────────────────────────────────────────────────
-function preTokenize(bytes: Uint8Array, out: Int32Array): number {
-  const n = bytes.length;
-  let start = 0, prev = CLS[bytes[0]], count = 0;
-  for (let i = 1; i < n; i++) {
-    const c = CLS[bytes[i]];
-    if (c !== prev) {
-      if (prev !== 0) { out[count++] = start; out[count++] = i - start; }
-      start = i; prev = c;
-    }
-  }
-  if (prev !== 0) { out[count++] = start; out[count++] = n - start; }
-  return count;
-}
-
-// ── BPE tokenizer (gigatoken-style linked-list merge) ────────────────
 const MAX = 0xFFFFFFFF;
-let mergeIds: Uint32Array, mergeRanks: Uint32Array, byteToId: Int32Array, stride: number;
-const buf = new Int32Array(2048);
-const next = new Uint8Array(2048), prev = new Int8Array(2048), ranks = new Uint32Array(2048);
-const wordsOut = new Int32Array(65536);
-const idsOut = new Int32Array(1048576); // 1M tokens max per chunk
+let mIds: Uint32Array, mRanks: Uint32Array, bId: Int32Array, stride: number;
+const buf = new Int32Array(2048), next = new Uint8Array(2048), prev = new Int8Array(2048), ranks = new Uint32Array(2048), wOut = new Int32Array(65536);
 
-function encodeChunk(bytes: Uint8Array): Int32Array {
-  const wordCount = preTokenize(bytes, wordsOut);
-  let idCount = 0;
-  for (let w = 0; w < wordCount; w += 2) {
-    const start = wordsOut[w], len = wordsOut[w + 1];
-    if (len <= 1) { if (len === 1) idsOut[idCount++] = byteToId[bytes[start]]; continue; }
-    const n = Math.min(len, 2048);
-    for (let i = 0; i < n; i++) buf[i] = byteToId[bytes[start + i]];
-    for (let i = 0; i < n; i++) { next[i] = i + 1; prev[i] = i - 1; }
-    for (let i = 0; i < n - 1; i++) ranks[i] = mergeRanks[buf[i] * stride + buf[i + 1]];
-    ranks[n - 1] = MAX;
-    let nn = n;
-    while (nn > 1) {
-      let best = MAX, bestI = 0;
-      for (let i = 0; i < nn - 1; i++) { if (ranks[i] < best) { best = ranks[i]; bestI = i; } }
-      if (best === MAX) break;
-      buf[bestI] = mergeIds[buf[bestI] * stride + buf[next[bestI]]];
-      const dead = next[bestI];
-      const newRight = next[dead];
-      next[bestI] = newRight;
-      ranks[dead] = MAX;
-      if (newRight < nn) { prev[newRight] = bestI; ranks[bestI] = mergeRanks[buf[bestI] * stride + buf[newRight]]; } else ranks[bestI] = MAX;
-      const left = prev[bestI];
-      if (left >= 0) ranks[left] = mergeRanks[buf[left] * stride + buf[bestI]];
-      nn--;
-    }
-    let write = 0, i = 0;
-    while (i < n) { buf[write++] = buf[i]; i = next[i]; }
-    for (let j = 0; j < write; j++) idsOut[idCount++] = buf[j];
-  }
-  return idsOut.subarray(0, idCount);
-}
-
-// ── message handler ──────────────────────────────────────────────────
 self.onmessage = (e: MessageEvent) => {
   const d = e.data;
   if (d.setup) {
-    mergeIds = d.mergeIds; mergeRanks = d.mergeRanks; byteToId = d.byteToId; stride = d.stride;
+    mIds = new Uint32Array(d.mergeSab); mRanks = new Uint32Array(d.mergeRanksSab);
+    bId = new Int32Array(d.byteToIdSab); stride = d.stride;
     (self as any).postMessage({ ready: true });
-    return;
-  }
-  if (d.work) {
-    const bytes: Uint8Array = d.bytes;
-    const ids = encodeChunk(bytes);
-    // transfer the result back (zero-copy)
-    (self as any).postMessage({ ids: new Int32Array(ids) }, [ids.buffer]);
-    return;
+  } else if (d.encode) {
+    const bytes = new Uint8Array(d.sab, d.inputOff, d.inputLen);
+    const output = new Int32Array(d.sab, d.outputOff, d.outputLen);
+    const n = bytes.length; let wc = 0, st = 0, pc = CLS[bytes[0]];
+    for (let i = 1; i < n; i++) { const c = CLS[bytes[i]]; if (c !== pc) { if (pc !== 0) { wOut[wc++] = st; wOut[wc++] = i - st; } st = i; pc = c; } }
+    if (pc !== 0) { wOut[wc++] = st; wOut[wc++] = n - st; }
+    let ic = 0;
+    for (let w = 0; w < wc; w += 2) {
+      const ws = wOut[w], wl = wOut[w + 1];
+      if (wl <= 1) { if (wl === 1) output[ic++] = bId[bytes[ws]]; continue; }
+      const wn = Math.min(wl, 2048);
+      for (let i = 0; i < wn; i++) buf[i] = bId[bytes[ws + i]];
+      for (let i = 0; i < wn; i++) { next[i] = i + 1; prev[i] = i - 1; }
+      for (let i = 0; i < wn - 1; i++) ranks[i] = mRanks[buf[i] * stride + buf[i + 1]];
+      ranks[wn - 1] = MAX; let nn = wn;
+      while (nn > 1) { let best = MAX, bi = 0; for (let i = 0; i < nn - 1; i++) { if (ranks[i] < best) { best = ranks[i]; bi = i; } } if (best === MAX) break;
+      buf[bi] = mIds[buf[bi] * stride + buf[next[bi]]]; const dd = next[bi], nr = next[dd]; next[bi] = nr; ranks[dd] = MAX;
+      if (nr < nn) { prev[nr] = bi; ranks[bi] = mRanks[buf[bi] * stride + buf[nr]]; } else ranks[bi] = MAX;
+      const lp = prev[bi]; if (lp >= 0) ranks[lp] = mRanks[buf[lp] * stride + buf[bi]]; nn--; }
+      let wr = 0, i = 0; while (i < wn) { buf[wr++] = buf[i]; i = next[i]; } for (let j = 0; j < wr; j++) output[ic++] = buf[j];
+    }
+    (self as any).postMessage({ done: true, count: ic });
   }
 };
