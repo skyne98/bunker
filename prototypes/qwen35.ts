@@ -6,6 +6,7 @@ import { dlopen, ptr as ffiPtr } from "bun:ffi";
 const H=1024, VOCAB=248320, NL=24, FAI=4, INTER=3584, QKVD=6144, ZD=2048, EPS=1e-6;
 const NH=8, NKV=2, HD=256, LKH=16, LVH=16, LKD=128, LVD=128;
 const KEYDIM=LKH*LKD, VALDIM=LVH*LVD; // 2048 each
+const QGATE=NH*HD*2, KV_DIM=NKV*HD; // 4096, 512
 const isFull = (l:number) => l % FAI === FAI-1;
 const BLK1 = (n:number) => Math.ceil(n/1024);
 
@@ -193,6 +194,57 @@ function buildGDNSeq1() {
   return b.build("gdn1",4,3);
 }
 
+// ── FA2 full attention for seq=1 ──
+// For seq=1: RoPE is identity (pos=0), attention is trivial (softmax of 1 element = 1.0)
+// attn_out = repeat(v, GQA) * sigmoid(gate)
+// Grid: [NH] (8 Q heads). Each program handles one Q head (HD=256).
+function buildFA2Seq1() {
+  const b=new TTIRBuilder();
+  const QG=b.param("QG",{ptr:"bf16"}),V=b.param("V",{ptr:"bf16"});
+  const QNW=b.param("QNW",{ptr:"bf16"}),Out=b.param("O",{ptr:"bf16"});
+  const head=b.programId(0);
+  const headKv=b.divi(head,b.i32(NH/NKV)); // head // (NH/NKV) — GQA repeat_interleave
+  const qOffIn=b.mul(head,b.i32(HD*2));
+  const gOffIn=b.add(qOffIn,b.i32(HD));
+  const qOffOut=b.mul(head,b.i32(HD));
+  const vOff=b.mul(headKv,b.i32(HD));
+  const tpQ=b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),qOffIn],[1,HD],"bf16",[1,0]);
+  const qRaw=b.fpext(b.load(tpQ,{boundaryCheck:[0,1],padding:1}),"f32");
+  const qRstd=b.rsqrtHw(b.add(b.divf(b.sum(b.mul(qRaw,qRaw),1),b.f32(HD)),b.f32(EPS)));
+  const qNorm=b.mul(qRaw,qRstd);
+  const tpQN=b.makeTensorPtr(QNW,[1,HD],[HD,1],[b.i32(0),b.i32(0)],[1,HD],"bf16",[1,0]);
+  const qWeighted=b.mul(qNorm,b.add(b.f32(1),b.fpext(b.load(tpQN,{boundaryCheck:[0,1],padding:1}),"f32")));
+  // Load gate
+  const tpG=b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),gOffIn],[1,HD],"bf16",[1,0]);
+  const gate=b.fpext(b.load(tpG,{boundaryCheck:[0,1],padding:1}),"f32");
+  const gateSig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(gate,b.f32(-1)))));
+  // Load v (GQA: headKv = head // (NH/NKV))
+  const tpV=b.makeTensorPtr(V,[1,KV_DIM],[KV_DIM,1],[b.i32(0),vOff],[1,HD],"bf16",[1,0]);
+  const vVal=b.fpext(b.load(tpV,{boundaryCheck:[0,1],padding:1}),"f32");
+  // attn_out = v * sigmoid(gate) (attention is trivial for seq=1)
+  const out=b.mul(vVal,gateSig);
+  const tpO=b.makeTensorPtr(Out,[1,NH*HD],[NH*HD,1],[b.i32(0),qOffOut],[1,HD],"bf16",[1,0]);
+  b.store(tpO,b.fptrunc(out,"bf16"),{boundaryCheck:[0,1]});
+  return b.build("fa2_1",4,4);
+}
+
+// k_norm: RMSNorm for k_proj output (2 heads × 256)
+function buildKNorm() {
+  const b=new TTIRBuilder();
+  const K=b.param("K",{ptr:"bf16"}),KNW=b.param("KNW",{ptr:"bf16"}),Out=b.param("O",{ptr:"bf16"});
+  const head=b.programId(0);
+  const off=b.mul(head,b.i32(HD));
+  const tpK=b.makeTensorPtr(K,[1,KV_DIM],[KV_DIM,1],[b.i32(0),off],[1,HD],"bf16",[1,0]);
+  const kRaw=b.fpext(b.load(tpK,{boundaryCheck:[0,1],padding:1}),"f32");
+  const kRstd=b.rsqrtHw(b.add(b.divf(b.sum(b.mul(kRaw,kRaw),1),b.f32(HD)),b.f32(EPS)));
+  const kNorm=b.mul(kRaw,kRstd);
+  const tpKN=b.makeTensorPtr(KNW,[1,HD],[HD,1],[b.i32(0),b.i32(0)],[1,HD],"bf16",[1,0]);
+  const kWeighted=b.mul(kNorm,b.add(b.f32(1),b.fpext(b.load(tpKN,{boundaryCheck:[0,1],padding:1}),"f32")));
+  const tpO=b.makeTensorPtr(Out,[1,KV_DIM],[KV_DIM,1],[b.i32(0),off],[1,HD],"bf16",[1,0]);
+  b.store(tpO,b.fptrunc(kWeighted,"bf16"),{boundaryCheck:[0,1]});
+  return b.build("knorm",4,3);
+}
+
 function launch(k:any,g:number[],bl:number[],args:any[],label:string) {
   const rc=cuLaunch(k,[g[0],g[1],g[2]] as [number,number,number],[bl[0],bl[1],bl[2]] as [number,number,number],args);
   const sr=cuSync(); if(rc)console.log(`  [!]${label} rc=${rc}`); if(sr)console.log(`  [!]${label} sync=${sr}`);
@@ -223,6 +275,13 @@ const kCs=compileAndLoad(buildCast(H),"cs",4);
 const kCsQKV=compileAndLoad(buildCast(QKVD),"cs",4);
 const kCsZD=compileAndLoad(buildCast(ZD),"cs",4);
 const kGDN1=compileAndLoad(buildGDNSeq1(),"gdn1",4);
+const kFA2=compileAndLoad(buildFA2Seq1(),"fa2_1",4);
+const kKNorm=compileAndLoad(buildKNorm(),"knorm",4);
+const kQProj=mm(seq,QGATE,H);
+const kKVProj=mm(seq,KV_DIM,H);
+const kOProj=mm(seq,H,NH*HD);
+const kCsKV=compileAndLoad(buildCast(KV_DIM),"cs",4);
+const kCsQG=compileAndLoad(buildCast(QGATE),"cs",4);
 console.log(`compiled ${14} kernels in ${((performance.now()-t0)/1000).toFixed(1)}s`);
 
 // embed
@@ -304,8 +363,29 @@ for(let layer=0;layer<NL;layer++){
     cuFree(gdnOut);
     if(layer<4)console.log(`  layer ${layer} (linear): GDN+out_proj`);
   } else {
-    // Full attention — placeholder (identity)
-    if(layer>=NL-2)console.log(`  layer ${layer} (full): FA2 placeholder`);
+    // ── Full attention (SelfAttention) — seq=1 optimized ──
+    const qgF32=cuAlloc(BigInt(seq*QGATE*4));
+    launch(kQProj,[Math.ceil(seq/64),Math.ceil(QGATE/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.q_proj.weight"),qgF32],`qp.L${layer}`);
+    const kF32=cuAlloc(BigInt(seq*KV_DIM*4));
+    launch(kKVProj,[Math.ceil(seq/64),Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.k_proj.weight"),kF32],`kp.L${layer}`);
+    const vF32=cuAlloc(BigInt(seq*KV_DIM*4));
+    launch(kKVProj,[Math.ceil(seq/64),Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.v_proj.weight"),vF32],`vp.L${layer}`);
+    const qgB=cuAlloc(BigInt(seq*QGATE*2));
+    launch(kCsQG,[BLK1(seq*QGATE),1,1],[128,1,1],[qgF32,qgB],`csQG.L${layer}`);
+    const kB=cuAlloc(BigInt(seq*KV_DIM*2));
+    launch(kCsKV,[BLK1(seq*KV_DIM),1,1],[128,1,1],[kF32,kB],`csK.L${layer}`);
+    const vB=cuAlloc(BigInt(seq*KV_DIM*2));
+    launch(kCsKV,[BLK1(seq*KV_DIM),1,1],[128,1,1],[vF32,vB],`csV.L${layer}`);
+    cuFree(qgF32);cuFree(kF32);cuFree(vF32);
+    const kNormB=cuAlloc(BigInt(seq*KV_DIM*2));
+    launch(kKNorm,[NKV,1,1],[128,1,1],[kB,wp(W,layer,"self_attn.k_norm.weight"),kNormB],`kn.L${layer}`);
+    cuFree(kB);
+    const fa2Out=cuAlloc(BigInt(seq*NH*HD*2));
+    launch(kFA2,[NH,1,1],[128,1,1],[qgB,vB,wp(W,layer,"self_attn.q_norm.weight"),fa2Out],`fa2.L${layer}`);
+    cuFree(qgB);cuFree(vB);
+    launch(kOProj,[Math.ceil(seq/64),Math.ceil(H/64),1],[128,1,1],[fa2Out,wp(W,layer,"self_attn.o_proj.weight"),attnF32],`op.L${layer}`);
+    cuFree(fa2Out);
+    if(layer<8)console.log(`  layer ${layer} (full): FA2+o_proj`);
   }
 
   // 3. cast + residual
