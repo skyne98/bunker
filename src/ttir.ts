@@ -247,7 +247,7 @@ export function cuDtoH(hostBuf: Buffer | ArrayBuffer, devPtr: bigint, bytes?: nu
 /** Free a device buffer. */
 export function cuFree(devPtr: bigint): void { cu().cuMemFree_v2(devPtr); }
 /** Synchronize the context. */
-export function cuSync(): void { cu().cuCtxSynchronize(); }
+export function cuSync(): number { return cu().cuCtxSynchronize(); }
 
 /** Launch a loaded kernel. `args` is an array of BigInt device pointers and numbers. */
 export function cuLaunch(k: LoadedKernel, grid: [number,number,number], block: [number,number,number], args: (bigint | number)[]): number {
