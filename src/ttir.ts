@@ -570,9 +570,9 @@ export class TTIRBuilder {
   remi(a: Value, b: Value): Value { return this.elemwise2(a, b, "remsi", "remsi"); }
 
   /** Minimum (type-aware). */
-  minimum(a: Value, b: Value): Value { return this.elemwise2(a, b, "minsi", "minf"); }
+  minimum(a: Value, b: Value): Value { return this.elemwise2(a, b, "minsi", "minimumf"); }
   /** Maximum (type-aware). */
-  maximum(a: Value, b: Value): Value { return this.elemwise2(a, b, "maxsi", "maxf"); }
+  maximum(a: Value, b: Value): Value { return this.elemwise2(a, b, "maxsi", "maximumf"); }
 
   // Bitwise (integer only)
   shl(a: Value, b: Value): Value { return this.bitwise(a, b, "shl"); }
@@ -631,7 +631,7 @@ export class TTIRBuilder {
   select(cond: Value, a: Value, b: Value): Value {
     if (cond.elem !== "i1") throw new Error(`select: cond must be i1, got ${cond.elem}`);
     const r = this.fresh("sel");
-    this.emit(`%${r} = arith.select ${cond.name}, ${a.name}, ${b.name} : ${typeText(cond.type)}, ${typeText(a.type)}, ${typeText(b.type)}`);
+    this.emit(`%${r} = "arith.select"(${cond.name}, ${a.name}, ${b.name}) : (${typeText(cond.type)}, ${typeText(a.type)}, ${typeText(b.type)}) -> ${typeText(a.type)}`);
     return tensor(`%${r}`, a.type.shape, a.elem);
   }
 
@@ -655,8 +655,8 @@ export class TTIRBuilder {
   /** Float → signed int. */
   fptosi(a: Value, to: "i8" | "i16" | "i32" | "i64"): Value { return this.cast1(a, "fptosi", to); }
   /** Float → float (widening/narrowing). */
-  fpext(a: Value, to: "f32" | "f64"): Value { return this.cast1(a, "fpext", to); }
-  fptrunc(a: Value, to: "f16" | "f32"): Value { return this.cast1(a, "fptrunc", to); }
+  fpext(a: Value, to: "f32" | "f64"): Value { return this.cast1(a, "extf", to); }
+  fptrunc(a: Value, to: "f16" | "f32"): Value { return this.cast1(a, "truncf", to); }
   /** Reinterpret bits. */
   bitcast(a: Value, to: ScalarElem): Value { return this.cast1(a, "bitcast", to); }
   /** Cast between `index` and integer types (needed for scf.for IV → i32 offsets). */

@@ -184,3 +184,56 @@ GPU/PCIe.** You cannot get a cold SSD→GPU op below the device read latency.
 - 1 MB chunks are the universal sweet spot: ~90% of max bandwidth at sub-ms
   latency. Drop to 64 KB only if you need the absolute lowest per-op latency and
   can afford the bandwidth hit.
+
+## fa2_clean.ts — FlashAttention-2 forward ported from Triton's `06-fused-attention`
+
+**Goal:** port the canonical clean Triton FA2 (`_attn_fwd_inner`) to the bunker
+`TTIRBuilder`, as the first of two FA2 ports (this = clean reference; next =
+vLLM's optimized `triton_unified_attention` with split-KV decode + GQA tiling).
+
+```bash
+bun run prototypes/fa2_clean.ts
+```
+
+**Result (RTX 3090, causal, f16 inputs / f32 softmax+acc):**
+- Correctness: **max err 0.0002** vs a host reference (256×256×64).
+- Throughput: **4.23 TFLOPS** (2048×2048×128, BM=128, BN=64, 8 warps) — a clean
+  unoptimized baseline; the vLLM-style port will close the gap to the 3090's
+  ~71 TFLOPS f16 peak.
+
+**The port is a near line-for-line translation** of the Triton inner loop:
+online softmax (running max `m_i` + sum `l_i`) carried as `scf.for` iter-args
+alongside the accumulator `O` and the advancing K/V tiled pointers — the same
+K-loop-with-iter-args pattern already used by the matmul kernel.
+
+```ts
+// core inner-loop body (per K/V tile), mirroring _attn_fwd_inner:
+const qk  = bb.mul(bb.dot(q, bb.trans(bb.load(tpK))), scale);  // Q @ Kᵀ
+const mask = bb.ge(rowBc, colBc);                               // causal
+const qkM = bb.select(mask, qk, negInf);                       // where(mask, qk, -inf)
+const m_ij = bb.maximum(m_i, bb.max(qkM, 1));                  // running max
+const alpha = bb.exp(bb.sub(m_i, m_ij));                       // rescale
+const p = bb.exp(bb.sub(qkM, m_ijBc));                         // softmax numerators
+const acc = bb.dot(bb.fptrunc(p, "f16"), bb.load(tpV),         // acc = α·acc + p@V
+                   bb.mul(acc, alphaBc));
+```
+
+Every op maps 1:1 to a Triton primitive the builder already exposes; **no
+libdevice needed** (`exp` inlines; FA2 uses no `rsqrt`/`sin`/`cos`).
+
+### Builder bugs found & fixed while porting (in `src/ttir.ts`)
+These primitives had never been exercised by a passing test:
+- `select`: emitted the 3-type custom form `arith.select … : i1, T, T` (rejected
+  by this MLIR). Fixed to the generic form `"arith.select"(...) : (i1,T,T) -> T`.
+- `maximum`/`minimum`: emitted the removed `arith.maxf`/`arith.minf`. Fixed to
+  `arith.maximumf`/`arith.minimumf` (MLIR renamed these).
+- `fptrunc`/`fpext`: emitted the removed `arith.fptrunc`/`arith.fpext`. Fixed to
+  `arith.truncf`/`arith.extf`.
+- Also fixed a stale hardcoded `cwd` path in `test_inline_compile.ts`.
+
+### Next: the vLLM port
+`prototypes/fa2_vllm.ts` (to do) will layer on the optimizations from IBM's
+"Anatomy of a Triton Attention Kernel" / vLLM's `triton_unified_attention`:
+GQA Q-block tiling, **split-KV parallel-tiled-softmax decode** (3D grid + a
+reduction kernel), decoupled tile sizes, and heuristic-tuned configs — taking
+the naive 19.7% → ~106% of FlashAttention-3.
