@@ -238,155 +238,131 @@ class Graph {
     for (let gi = 0; gi < groups.length; gi++) {
       const group = groups[gi];
       const b = new TTIRBuilder();
-      const argMap = new Map<string, number>(); // tensorName → param index
       const args: string[] = [];
-      let argIdx = 0;
-      const ssa = new Map<string, any>(); // tensorName → TTIR Value
+      const paramVals = new Map<string, any>(); // tensorName → param Value (pointer)
+      const ssa = new Map<string, any>(); // tensorName → SSA Value (computed)
 
-      // Collect external params (inputs not produced in this group + outputs consumed outside)
+      // Pass 1: collect external tensors (touch global memory) and create params
+      const external = new Set<string>();
       for (const node of group) {
         for (const inp of node.inputs) {
           const tensor = this.tensors.get(inp.tensorName)!;
           const isExternal = tensor.role !== "data" || !tensor.producer || !group.includes(tensor.producer);
-          if (isExternal && !argMap.has(inp.tensorName)) {
-            const p = b.param(`arg${argIdx}`, { ptr: tensor.type.dtype as any });
-            argMap.set(inp.tensorName, argIdx);
-            args.push(inp.tensorName);
-            argIdx++;
-          }
+          if (isExternal) external.add(inp.tensorName);
         }
       }
       for (const node of group) {
         for (const out of node.outputs) {
           const tensor = this.tensors.get(out.tensorName)!;
-          const isExternal = !tensor.isFusedAway;
-          if (isExternal && !argMap.has(out.tensorName)) {
-            const p = b.param(`arg${argIdx}`, { ptr: tensor.type.dtype as any });
-            argMap.set(out.tensorName, argIdx);
-            args.push(out.tensorName);
-            argIdx++;
+          if (!tensor.isFusedAway) external.add(out.tensorName);
+        }
+      }
+      for (const name of external) {
+        const tensor = this.tensors.get(name)!;
+        const p = b.param(`arg${args.length}`, { ptr: tensor.type.dtype as any });
+        args.push(name);
+        paramVals.set(name, p);
+      }
+
+      // Determine group tile shape (GEMM sets it, others inherit)
+      let groupTile: number[] = [1, 1024]; // default for element-wise groups
+      for (const node of group) {
+        if (node.op === "gemm") {
+          groupTile = [Math.min(64, node.params.M), Math.min(64, node.params.N)];
+          break;
+        }
+      }
+
+      // Pass 2: emit operations
+      for (const node of group) {
+        let output: any;
+
+        if (node.op === "gemm") {
+          const Aptr = this.resolvePtr(node.inputs[0], paramVals, ssa);
+          const Bptr = this.resolvePtr(node.inputs[1], paramVals, ssa);
+          output = this.emitGemm(b, Aptr, Bptr, node.params);
+        } else {
+          // Element-wise ops: resolve inputs as SSA values or load from global memory
+          const inputs = node.inputs.map(inp => this.resolveValue(b, inp, paramVals, ssa, groupTile));
+          switch (node.op) {
+            case "cast":
+              output = node.params.to === "bf16" ? b.fptrunc(inputs[0], "bf16") : b.fpext(inputs[0], node.params.to as any);
+              break;
+            case "add":
+              output = b.add(inputs[0], inputs[1]);
+              break;
+            case "rmsnorm":
+              output = this.emitRmsNorm(b, inputs, node.params);
+              break;
+            case "swiglu":
+              output = this.emitSwiGLU(b, inputs, node.params);
+              break;
+            default:
+              output = b.f32(0); // placeholder for complex ops
+              break;
+          }
+        }
+
+        // Route output: SSA value (fused away) or store to global memory
+        for (const outIO of node.outputs) {
+          const outTensor = this.tensors.get(outIO.tensorName)!;
+          if (outTensor.isFusedAway) {
+            ssa.set(outIO.tensorName, output);
+          } else {
+            // Store to global memory (use group tile shape)
+            const p = paramVals.get(outIO.tensorName)!;
+            const N = groupTile[1];
+            const p0 = b.programId(0);
+            const off = b.mul(p0, b.i32(N));
+            const tp = b.makeTensorPtr(p, [1, N], [N, 1], [b.i32(0), off], groupTile, outTensor.type.dtype as any, [1, 0]);
+            const storeVal = outTensor.type.dtype === "bf16" ? b.fptrunc(output, "bf16") : output;
+            b.store(tp, storeVal, {boundaryCheck: [0, 1]});
           }
         }
       }
 
-      // Emit TTIR for each node in the group
-      for (const node of group) {
-        // Resolve inputs: SSA value or load from global memory
-        const inputs = node.inputs.map(inp => {
-          if (ssa.has(inp.tensorName)) return ssa.get(inp.tensorName);
-          // Load from global memory
-          const tensor = this.tensors.get(inp.tensorName)!;
-          const argI = argMap.get(inp.tensorName)!;
-          const shape = tensor.type.shape;
-          const strides = tensor.type.strides;
-          // Use programId for tiling
-          const p0 = b.programId(0);
-          const p1 = b.programId(1);
-          const tileShape = this.computeTileShape(node, shape);
-          const offsets = node.op === "gemm"
-            ? [b.mul(p0, b.i32(tileShape[0])), b.mul(p1, b.i32(tileShape[1]))]
-            : [p0, b.i32(0)];
-          const tp = b.makeTensorPtr(
-            b.param(`arg${argI}`, {ptr: tensor.type.dtype as any}),
-            shape.length === 1 ? [1, shape[0]] : shape,
-            strides.length === 1 ? [shape[0], 1] : strides,
-            offsets,
-            tileShape,
-            tensor.type.dtype as any,
-            [1, 0].slice(0, shape.length)
-          );
-          return b.load(tp, {boundaryCheck: [0, 1], padding: 1});
-        });
-
-        // Emit operation
-        let output: any;
-        switch (node.op) {
-          case "gemm":
-            output = this.emitGemm(b, inputs, node.params, node.grid);
-            break;
-          case "cast":
-            output = node.params.to === "bf16"
-              ? b.fptrunc(inputs[0], "bf16")
-              : b.fpext(inputs[0], node.params.to as any);
-            break;
-          case "add":
-            output = b.add(inputs[0], inputs[1]);
-            break;
-          case "rmsnorm":
-            output = this.emitRmsNorm(b, inputs, node.params);
-            break;
-          case "swiglu":
-            output = this.emitSwiGLU(b, inputs, node.params);
-            break;
-          default:
-            // For complex ops (conv1d, gdn, fa2), we can't easily inline them.
-            // In the prototype, we just note that they'd be standalone kernels.
-            output = b.f32(0); // placeholder
-            break;
-        }
-
-        // Route output: SSA value (fused away) or store to global memory
-        const outIO = node.outputs[0]; // primary output
-        const outTensor = this.tensors.get(outIO.tensorName)!;
-        if (outTensor.isFusedAway) {
-          ssa.set(outIO.tensorName, output);
-        } else {
-          // Store to global memory
-          const argI = argMap.get(outIO.tensorName)!;
-          const shape = outTensor.type.shape;
-          const strides = outTensor.type.strides;
-          const p0 = b.programId(0);
-          const p1 = b.programId(1);
-          const tileShape = this.computeTileShape(node, shape);
-          const offsets = node.op === "gemm"
-            ? [b.mul(p0, b.i32(tileShape[0])), b.mul(p1, b.i32(tileShape[1]))]
-            : [p0, b.i32(0)];
-          const storeVal = outTensor.type.dtype === "bf16" ? b.fptrunc(output, "bf16") : output;
-          const tp = b.makeTensorPtr(
-            b.param(`arg${argI}`, {ptr: outTensor.type.dtype as any}),
-            shape.length === 1 ? [1, shape[0]] : shape,
-            strides.length === 1 ? [shape[0], 1] : strides,
-            offsets,
-            tileShape,
-            outTensor.type.dtype as any,
-            [1, 0].slice(0, shape.length)
-          );
-          b.store(tp, storeVal, {boundaryCheck: [0, 1]});
-        }
-      }
-
       const name = `fused_${gi}`;
-      const ttir = b.build(name, 4, argIdx);
+      const ttir = b.build(name, 4, args.length);
       kernels.push({ ttir, name, args, grid: group[0].grid });
     }
     return kernels;
   }
 
-  // Helpers for codegen (b is the TTIRBuilder)
-  private computeTileShape(node: GraphNode, shape: number[]): number[] {
-    const BLK = 64;
-    if (node.op === "gemm") {
-      return [Math.min(BLK, node.params.M), Math.min(BLK, node.params.N)];
-    }
-    return [1, Math.min(1024, shape[shape.length - 1] || shape[0])];
+  // Resolve a pointer: if external, return param Value; if SSA, error (GEMM can't use SSA)
+  private resolvePtr(io: NodeIO, paramVals: Map<string, any>, ssa: Map<string, any>): any {
+    const p = paramVals.get(io.tensorName);
+    if (p) return p;
+    throw new Error(`GEMM input ${io.tensorName} is not an external pointer (cannot use SSA for GEMM input)`);
   }
 
-  private emitGemm(b: TTIRBuilder, inputs: any[], params: any, grid: [number,number,number]): any {
+  // Resolve a value: SSA value if fused, else load from global memory
+  private resolveValue(b: TTIRBuilder, io: NodeIO, paramVals: Map<string, any>, ssa: Map<string, any>, tile: number[]): any {
+    if (ssa.has(io.tensorName)) return ssa.get(io.tensorName);
+    const p = paramVals.get(io.tensorName)!;
+    const N = tile[1];
+    const p0 = b.programId(0);
+    const off = b.mul(p0, b.i32(N));
+    const tp = b.makeTensorPtr(p, [1, io.type.shape[io.type.shape.length-1]], [io.type.shape[io.type.shape.length-1], 1], [b.i32(0), off], tile, io.type.dtype as any, [1, 0]);
+    return b.load(tp, {boundaryCheck: [0, 1], padding: 1});
+  }
+
+  // Emit a proper GEMM with dot loop
+  private emitGemm(b: TTIRBuilder, Aptr: any, Bptr: any, params: any): any {
     const M = params.M, N = params.N, K = params.K;
     const BM = Math.min(64, M), BN = Math.min(64, N), BK = Math.min(64, K);
-    // For codegen, we need to handle the case where inputs are SSA values vs loaded from memory.
-    // For the GEMM, inputs A and B are always loaded from global memory (weights, or previous layer output).
-    // So inputs[0] and inputs[1] are already loaded Values.
-    // We need to do the dot product loop.
-    // But the dot loop needs makeTensorPtr + advance, not raw values.
-    // For the prototype, we'll just do a simple dot without the loop.
-    // In practice, the GEMM codegen would need to create its own makeTensorPtrs.
-    // For now, return a placeholder.
-    return b.f32(0); // TODO: proper GEMM codegen
+    const pM = b.programId(0), pN = b.programId(1);
+    const tpA = b.makeTensorPtr(Aptr, [M, K], [K, 1], [b.mul(pM, b.i32(BM)), b.i32(0)], [BM, BK], "bf16", [1, 0]);
+    const tpB = b.makeTensorPtr(Bptr, [K, N], [1, K], [b.i32(0), b.mul(pN, b.i32(BN))], [BK, BN], "bf16", [0, 1]);
+    const a0 = b.zeros([BM, BN], "f32");
+    const [acc] = b.forIter(b.index(0), b.index(K), b.index(BK), [a0, tpA, tpB], (bb, _, [a, tA, tB]) => {
+      const n = bb.dot(bb.load(tA), bb.load(tB), a);
+      return [n, bb.advance(tA, [bb.i32(0), bb.i32(BK)]), bb.advance(tB, [bb.i32(BK), bb.i32(0)])];
+    });
+    return acc; // f32 accumulator — SSA value, no store yet
   }
 
   private emitRmsNorm(b: TTIRBuilder, inputs: any[], params: any): any {
-    const x = inputs[0]; // already loaded
+    const x = inputs[0];
     const w = inputs[1];
     const N = params.N;
     const ms = b.divf(b.sum(b.mul(x, x), 1), b.f32(N));
