@@ -5,6 +5,25 @@
 import { TTIRBuilder, compileAndLoad, cuAlloc, cuHtoD, cuDtoH, cuFree, cuSync, cuLaunch } from "../src/ttir";
 import { dlopen, ptr as ffiPtr } from "bun:ffi";
 
+// ── Memory pool: eliminate cuAlloc overhead ──
+const _pool = new Map<number, bigint[]>();
+const _sizes = new Map<bigint, number>();
+let _allocCount = 0, _poolHits = 0;
+function palloc(bytes: number): bigint {
+  const stack = _pool.get(bytes);
+  if (stack && stack.length > 0) { _poolHits++; return stack.pop()!; }
+  _allocCount++;
+  const ptr = cuAlloc(BigInt(bytes));
+  _sizes.set(ptr, bytes);
+  return ptr;
+}
+function pfree(ptr: bigint) {
+  const sz = _sizes.get(ptr);
+  if (sz === undefined) return;
+  if (!_pool.has(sz)) _pool.set(sz, []);
+  _pool.get(sz)!.push(ptr);
+}
+
 const H=1024, VOCAB=248320, NL=24, FAI=4, INTER=3584, QKVD=6144, ZD=2048, EPS=1e-6;
 const NH=8, NKV=2, HD=256, LKH=16, LVH=16, LKD=128, LVD=128, KEYDIM=LKH*LKD, VALDIM=LVH*LVD;
 const QGATE=NH*HD*2, KV_DIM=NKV*HD;
@@ -573,6 +592,65 @@ function buildFA2Decode() {
   return b.build("fa2_d",4,10);
 }
 
+// ── GPU argmax: finds index of max value in logits [VOCAB] f32 ──
+// Grid: [1]. Loops over chunks of 4096, tracks global max + index.
+function buildArgmax() {
+  const b=new TTIRBuilder();
+  const L=b.param("L",{ptr:"f32"}),OutVal=b.param("V",{ptr:"f32"}),OutIdx=b.param("I",{ptr:"i32"});
+  const CHUNK=4096;
+  const initMax=b.broadcastTo(b.f32(-1e30),[1]);
+  const initIdx=b.broadcastTo(b.i32(0),[1]);
+  const [finalMax,finalIdx]=b.forIter(b.index(0),b.index(VOCAB),b.index(CHUNK),[initMax,initIdx],(bb,i,[curMax,curIdx])=>{
+    const tp=bb.makeTensorPtr(L,[1,VOCAB],[VOCAB,1],[b.i32(0),i],[1,CHUNK],"f32",[1,0]);
+    const chunk=bb.load(tp,{boundaryCheck:[0,1],padding:1});
+    const localMax=bb.max(chunk,1); // [1]
+    // Find index of local max within chunk
+    const mask=bb.eq(chunk,bb.broadcastTo(localMax,[1,CHUNK])); // [1, CHUNK] i1
+    const arange=bb.arange(0,CHUNK); // [CHUNK] i32
+    const arangeBc=bb.broadcast(bb.expandDims(arange,0),[1,CHUNK]); // [1, CHUNK] i32
+    const masked=bb.select(mask,arangeBc,bb.broadcastTo(bb.i32(0),[1,CHUNK])); // [1, CHUNK] i32
+    const localIdx=bb.sum(masked,1); // [1] i32
+    const globalIdx=bb.add(localIdx,bb.broadcastTo(i,[1])); // [1] i32
+    // Update global max if local is better
+    const isBetter=bb.gt(localMax,curMax); // [1] i1
+    const newMax=bb.select(isBetter,localMax,curMax); // [1] f32
+    const newIdx=bb.select(isBetter,globalIdx,curIdx); // [1] i32
+    return [newMax,newIdx];
+  });
+  b.store(OutVal,finalMax);
+  b.store(OutIdx,finalIdx);
+  return b.build("argmax",4,3);
+}
+
+// ── GPU argmax: finds index of max value in logits [VOCAB] f32 ──
+// Grid: [1]. Loops over chunks of 4096, tracks global max + index.
+function buildArgmax() {
+  const b=new TTIRBuilder();
+  const L=b.param("L",{ptr:"f32"}),OutVal=b.param("V",{ptr:"f32"}),OutIdx=b.param("I",{ptr:"i32"});
+  const CHUNK=4096;
+  const tpL=b.makeTensorPtr(L,[1,VOCAB],[VOCAB,1],[b.i32(0),b.i32(0)],[1,CHUNK],"f32",[1,0]);
+  const initMax=b.broadcastTo(b.f32(-1000),[1]);
+  const initIdx=b.broadcastTo(b.i32(0),[1]);
+  const initOff=b.broadcastTo(b.i32(0),[1]);
+  const [finalMax,finalIdx]=b.forIter(b.index(0),b.index(VOCAB),b.index(CHUNK),[initMax,initIdx,initOff,tpL],(bb,_,[curMax,curIdx,curOff,tp])=>{
+    const chunk=bb.load(tp,{boundaryCheck:[0,1],padding:1});
+    const localMax=bb.max(chunk,1);
+    const mask=bb.eq(chunk,bb.broadcastTo(localMax,[1,CHUNK]));
+    const arange=bb.arange(0,CHUNK);
+    const arangeBc=bb.broadcast(bb.expandDims(arange,0),[1,CHUNK]);
+    const masked=bb.select(mask,arangeBc,bb.broadcastTo(bb.i32(0),[1,CHUNK]));
+    const localIdx=bb.sum(masked,1);
+    const globalIdx=bb.add(localIdx,curOff);
+    const isBetter=bb.gt(localMax,curMax);
+    const newMax=bb.select(isBetter,localMax,curMax);
+    const newIdx=bb.select(isBetter,globalIdx,curIdx);
+    return [newMax,newIdx,bb.add(curOff,bb.broadcastTo(bb.i32(CHUNK),[1])),bb.advance(tp,[bb.i32(0),bb.i32(CHUNK)])];
+  });
+  b.store(b.makeTensorPtr(OutVal,[1,1],[1,1],[b.i32(0),b.i32(0)],[1,1],"f32",[1,0]),b.broadcastTo(finalMax,[1,1]),{boundaryCheck:[0,1]});
+  b.store(b.makeTensorPtr(OutIdx,[1,1],[1,1],[b.i32(0),b.i32(0)],[1,1],"i32",[1,0]),b.broadcastTo(finalIdx,[1,1]),{boundaryCheck:[0,1]});
+  return b.build("argmax",4,3);
+}
+
 function launch(k:any,g:number[],bl:number[],args:any[],label:string) {
   cuLaunch(k,[g[0],g[1],g[2]] as [number,number,number],[bl[0],bl[1],bl[2]] as [number,number,number],args);
   // No cuSync — cuDtoH/cuHtoD block implicitly. GPU ops queue on default stream.
@@ -624,6 +702,9 @@ const kRoPEK=compileAndLoad(buildRoPEKInPlace(),"ropek",4);
 const kQNorm=compileAndLoad(buildQNorm(),"qn",4);
 const kKNormD=compileAndLoad(buildKNormD(),"knormd",4);
 const kFA2A=compileAndLoad(buildFA2Attn(),"fa2a",4);
+const kArgmax=compileAndLoad(buildArgmax(),"argmax",4);
+const argmaxVal=cuAlloc(BigInt(4)); // f32 max value
+const argmaxIdx=cuAlloc(BigInt(4)); // i32 argmax index
 // Precompute RoPE cos/sin tables [MAX_LEN, 32] f32
 const ropeCosTable=new Float32Array(MAX_LEN*ROT_HALF);
 const ropeSinTable=new Float32Array(MAX_LEN*ROT_HALF);
@@ -722,122 +803,128 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
   
   // Embed current token
   const emb = getEmbedding(tokenId);
-  x = cuAlloc(BigInt(H*2));
+  x = palloc(H*2);
   cuHtoD(x, emb.buffer); cuSync();
   
   // Forward pass (1 token, with state carry)
   for (let layer=0; layer<NL; layer++) {
     const full=isFull(layer);
     // 1. input_layernorm
-    const normed=cuAlloc(BigInt(H*2));
+    const normed=palloc(H*2);
     launch(kRms,[1,1,1],[128,1,1],[x,wp(W,layer,"input_layernorm.weight"),normed],`rms1.${layer}.${step}`);
     
-    let attnF32=cuAlloc(BigInt(H*4));
+    let attnF32=palloc(H*4);
     
     if (!full) {
       // GDN decode
-      const qkv=cuAlloc(BigInt(QKVD*4));
+      const qkv=palloc(QKVD*4);
       launch(kQKV,[1,Math.ceil(QKVD/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_qkv.weight"),qkv],`qkv.${layer}`);
-      const z=cuAlloc(BigInt(ZD*4));
+      const z=palloc(ZD*4);
       launch(kZ,[1,Math.ceil(ZD/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_z.weight"),z],`z.${layer}`);
-      const aP=cuAlloc(BigInt(LVH*4));
+      const aP=palloc(LVH*4);
       launch(kA,[1,1,1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_a.weight"),aP],`a.${layer}`);
-      const bP=cuAlloc(BigInt(LVH*4));
+      const bP=palloc(LVH*4);
       launch(kB,[1,1,1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_b.weight"),bP],`b.${layer}`);
       // Decay is now computed on the GPU (log2Hw for softplus) — no CPU round-trip needed
-      const qkvB=cuAlloc(BigInt(QKVD*2));
+      const qkvB=palloc(QKVD*2);
       launch(kCsQKV,[BLK1(QKVD),1,1],[128,1,1],[qkv,qkvB],`csQ.${layer}`);
-      const zB=cuAlloc(BigInt(ZD*2));
+      const zB=palloc(ZD*2);
       launch(kCsZD,[BLK1(ZD),1,1],[128,1,1],[z,zB],`csZ.${layer}`);
-      //cuFree(qkv); //cuFree(z);
+      pfree(qkv); pfree(z);
       // Conv1d decode (with conv state)
-      const convOut=cuAlloc(BigInt(QKVD*2));
+      const convOut=palloc(QKVD*2);
       launch(kConv1dD,[BLK1(QKVD),1,1],[128,1,1],[qkvB,convStates[layer],wp(W,layer,"linear_attn.conv1d.weight"),convOut,convStatesNew[layer]],`cv1d.${layer}`);
       // Swap conv state
       const tmpCs = convStates[layer]; convStates[layer] = convStatesNew[layer]; convStatesNew[layer] = tmpCs;
-      //cuFree(qkvB);
+      pfree(qkvB);
       // GDN delta rule (with recurrent state)
-      const gdnOut=cuAlloc(BigInt(ZD*2));
+      const gdnOut=palloc(ZD*2);
       launch(kGDND,[LVH,1,1],[128,1,1],[convOut,zB,wp(W,layer,"linear_attn.A_log"),wp(W,layer,"linear_attn.dt_bias"),aP,bP,wp(W,layer,"linear_attn.norm.weight"),sStates[layer],gdnOut,sStatesNew[layer]],`gdn.${layer}`);
       const tmpSs = sStates[layer]; sStates[layer] = sStatesNew[layer]; sStatesNew[layer] = tmpSs;
-      //cuFree(convOut); //cuFree(zB); //cuFree(aP); //cuFree(bP);
+      pfree(convOut); pfree(zB); pfree(aP); pfree(bP);
       // out_proj
       launch(kOutProj,[1,Math.ceil(H/64),1],[128,1,1],[gdnOut,wp(W,layer,"linear_attn.out_proj.weight"),attnF32],`op.${layer}`);
-      //cuFree(gdnOut);
+      pfree(gdnOut);
     } else {
       // FA2 decode: q_norm → GPU RoPE → k_norm → GPU RoPE → attention — ALL on GPU
-      const qgF32=cuAlloc(BigInt(QGATE*4));
+      const qgF32=palloc(QGATE*4);
       launch(kQProj,[1,Math.ceil(QGATE/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.q_proj.weight"),qgF32],`qp.${layer}`);
-      const kF32=cuAlloc(BigInt(KV_DIM*4));
+      const kF32=palloc(KV_DIM*4);
       launch(kKVProj,[1,Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.k_proj.weight"),kF32],`kp.${layer}`);
-      const vF32=cuAlloc(BigInt(KV_DIM*4));
+      const vF32=palloc(KV_DIM*4);
       launch(kKVProj,[1,Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.v_proj.weight"),vF32],`vp.${layer}`);
-      const qgB=cuAlloc(BigInt(QGATE*2));
+      const qgB=palloc(QGATE*2);
       launch(kCsQG,[BLK1(QGATE),1,1],[128,1,1],[qgF32,qgB],`csQG.${layer}`);
-      const vB=cuAlloc(BigInt(KV_DIM*2));
+      const vB=palloc(KV_DIM*2);
       launch(kCsKV,[BLK1(KV_DIM),1,1],[128,1,1],[vF32,vB],`csV.${layer}`);
-      const kB=cuAlloc(BigInt(KV_DIM*2));
+      const kB=palloc(KV_DIM*2);
       launch(kCsKV,[BLK1(KV_DIM),1,1],[128,1,1],[kF32,kB],`csK.${layer}`);
       // q_norm → QBuf, then GPU RoPE in-place
       launch(kQNorm,[NH,1,1],[128,1,1],[qgB,wp(W,layer,"self_attn.q_norm.weight"),qBuf],`qn.${layer}`);
       launch(kRoPE,[NH,1,1],[128,1,1],[qBuf,ropeCosD,ropeSinD,step],`rope.${layer}`);
       // k_norm → kNormB, then GPU RoPE in-place
-      const kNormB=cuAlloc(BigInt(KV_DIM*2));
+      const kNormB=palloc(KV_DIM*2);
       launch(kKNormD,[NKV,1,1],[128,1,1],[kB,wp(W,layer,"self_attn.k_norm.weight"),kNormB],`kn.${layer}`);
       launch(kRoPEK,[NKV,1,1],[128,1,1],[kNormB,ropeCosD,ropeSinD,step],`ropek.${layer}`);
       // Update mask
       for(let i=0;i<=step;i++) maskData[i]=0; for(let i=step+1;i<MAX_LEN;i++) maskData[i]=-1e30;
       cuHtoD(maskBuf,maskData.buffer);
       // FA2 attention (pre-rotated q from QBuf, k from kNormB, v from vB)
-      const fa2Out=cuAlloc(BigInt(NH*HD*2));
+      const fa2Out=palloc(NH*HD*2);
       launch(kFA2A,[NH,1,1],[128,1,1],[qBuf,kNormB,vB,qgB,kvCacheK[layer],kvCacheV[layer],maskBuf,fa2Out,step],`fa2.${layer}`);
+      pfree(qgF32); pfree(kF32); pfree(vF32); pfree(qgB); pfree(vB); pfree(kB); pfree(kNormB);
       // o_proj
       launch(kOProj,[1,Math.ceil(H/64),1],[128,1,1],[fa2Out,wp(W,layer,"self_attn.o_proj.weight"),attnF32],`op.${layer}`);
+      pfree(fa2Out);
     }
     
     // cast + residual
-    const attnBf=cuAlloc(BigInt(H*2));
+    const attnBf=palloc(H*2);
     launch(kCs,[BLK1(H),1,1],[128,1,1],[attnF32,attnBf],`cast.${layer}`);
-    const afterAttn=cuAlloc(BigInt(H*2));
+    const afterAttn=palloc(H*2);
     launch(kAd,[BLK1(H),1,1],[128,1,1],[x,attnBf,afterAttn],`add1.${layer}`);
-    //cuFree(x); //cuFree(attnF32); //cuFree(attnBf); //cuFree(normed);
+    pfree(x); pfree(attnF32); pfree(attnBf); pfree(normed);
     
     // post_attention_layernorm
-    const normed2=cuAlloc(BigInt(H*2));
+    const normed2=palloc(H*2);
     launch(kRms,[1,1,1],[128,1,1],[afterAttn,wp(W,layer,"post_attention_layernorm.weight"),normed2],`rms2.${layer}`);
     
     // MLP
-    const gate=cuAlloc(BigInt(INTER*4));
+    const gate=palloc(INTER*4);
     launch(kGP,[1,Math.ceil(INTER/64),1],[128,1,1],[normed2,wp(W,layer,"mlp.gate_proj.weight"),gate],`gp.${layer}`);
-    const up=cuAlloc(BigInt(INTER*4));
+    const up=palloc(INTER*4);
     launch(kUP,[1,Math.ceil(INTER/64),1],[128,1,1],[normed2,wp(W,layer,"mlp.up_proj.weight"),up],`up.${layer}`);
-    const act=cuAlloc(BigInt(INTER*2));
+    const act=palloc(INTER*2);
     launch(kSg,[BLK1(INTER),1,1],[128,1,1],[gate,up,act],`sg.${layer}`);
-    //cuFree(gate); //cuFree(up); //cuFree(normed2);
-    const mlpOut=cuAlloc(BigInt(H*4));
+    pfree(gate); pfree(up); pfree(normed2);
+    const mlpOut=palloc(H*4);
     launch(kDP,[1,Math.ceil(H/64),1],[128,1,1],[act,wp(W,layer,"mlp.down_proj.weight"),mlpOut],`dp.${layer}`);
-    //cuFree(act);
+    pfree(act);
     
-    const mlpBf=cuAlloc(BigInt(H*2));
+    const mlpBf=palloc(H*2);
     launch(kCs,[BLK1(H),1,1],[128,1,1],[mlpOut,mlpBf],`cast2.${layer}`);
-    x=cuAlloc(BigInt(H*2));
+    x=palloc(H*2);
     launch(kAd,[BLK1(H),1,1],[128,1,1],[afterAttn,mlpBf,x],`add2.${layer}`);
-    //cuFree(afterAttn); //cuFree(mlpOut); //cuFree(mlpBf);
+    pfree(afterAttn); pfree(mlpOut); pfree(mlpBf);
   }
   
   // Final norm + lm_head
-  const fn=cuAlloc(BigInt(H*2));
+  const fn=palloc(H*2);
   launch(kRms,[1,1,1],[128,1,1],[x,W.get("model.language_model.norm.weight")!,fn],`rmsF`);
-  const logits=cuAlloc(BigInt(VOCAB*4));
+  const logits=palloc(VOCAB*4);
   launch(kLM,[1,Math.ceil(VOCAB/64),1],[128,1,1],[fn,embedW,logits],`lmHead`);
   cuSync();
   
-  // argmax
-  const hLog=new Float32Array(VOCAB);
-  cuDtoH(hLog.buffer,logits,BigInt(VOCAB*4));
-  //cuFree(x); //cuFree(fn); //cuFree(logits);
-  let bestId=0,bestLog=-Infinity;
-  for(let i=0;i<VOCAB;i++) if(hLog[i]>bestLog){bestLog=hLog[i];bestId=i;}
+  // GPU argmax — no 1MB download, just 4 bytes
+  launch(kArgmax,[1,1,1],[128,1,1],[logits,argmaxVal,argmaxIdx],`argmax`);
+  cuSync();
+  pfree(x); pfree(fn); pfree(logits);
+  const idxBuf=new Int32Array(1);
+  cuDtoH(idxBuf.buffer,argmaxIdx,BigInt(4));
+  const valBuf=new Float32Array(1);
+  cuDtoH(valBuf.buffer,argmaxVal,BigInt(4));
+  const bestId=idxBuf[0];
+  const bestLog=valBuf[0];
   
   if (step >= tokenIds.length - 1) {
     // This is a generated token
@@ -852,6 +939,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
 
 const dt=(performance.now()-fStart)/1000;
 console.log(`\nGenerated ${genLen} tokens in ${dt.toFixed(1)}s (${(genLen/dt).toFixed(1)} tok/s)`);
+console.log(`Pool: ${_allocCount} allocs, ${_poolHits} pool hits (hit rate: ${(_poolHits/(_allocCount+_poolHits)*100).toFixed(0)}%)`);
 console.log(`\n=== Generated Text ===`);
 
 // Decode tokens to text using the tokenizer (we need to reverse the tokenization)
