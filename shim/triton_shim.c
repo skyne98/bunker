@@ -145,9 +145,14 @@ const char* triton_compile_targeted(const char* ttir_mlir, int num_warps,
     pm.enableVerifier(true);
 
     // Rewrite tensor pointers (make_tensor_ptr → explicit ptr arithmetic)
+    pm.addPass(mlir::createInlinerPass());
     pm.addPass(mlir::triton::createTritonRewriteTensorPointer());
     pm.addPass(mlir::triton::createTritonRewriteTensorDescriptorToPointer());
     pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::triton::createTritonCombineOps());
+    pm.addPass(mlir::triton::createTritonReorderBroadcast());
+    pm.addPass(mlir::createCSEPass());
+    pm.addPass(mlir::createSymbolDCEPass());
 
     // Unroll loops so accelerate_matmul can match every tt.dot
     pm.addPass(mlir::triton::createTritonLoopUnroll());
@@ -163,11 +168,24 @@ const char* triton_compile_targeted(const char* ttir_mlir, int num_warps,
 
     // TTGIR optimizations
     pm.addPass(mlir::triton::gpu::createTritonGPUCoalesce());
+    pm.addPass(mlir::triton::gpu::createTritonGPUF32DotTC());
     pm.addPass(mlir::triton::gpu::createTritonGPURemoveLayoutConversions());
+    pm.addPass(mlir::triton::gpu::createTritonGPUOptimizeThreadLocality());
     pm.addPass(mlir::triton::gpu::createTritonGPUAccelerateMatmul());
+    pm.addPass(mlir::triton::gpu::createTritonGPURemoveLayoutConversions());
+    pm.addPass(mlir::triton::gpu::createTritonGPUOptimizeDotOperands());
     pm.addPass(mlir::triton::createTritonLoopAwareCSE());
-    pm.addPass(mlir::triton::gpu::createTritonGPUCombineTensorSelectAndIf());
+    pm.addPass(mlir::triton::gpu::createTritonGPUFuseNestedLoops());
     pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::triton::createTritonLoopInvariantCodeMotion());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::triton::gpu::createTritonGPUCombineTensorSelectAndIf());
+    pm.addPass(mlir::triton::gpu::createTritonGPUAssignLatencies());
+    pm.addPass(mlir::triton::gpu::createTritonGPUScheduleLoops());
+    pm.addPass(mlir::triton::gpu::createTritonGPUPipeline());
+    pm.addPass(mlir::triton::gpu::createTritonGPUFuseNestedLoops());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::triton::createTritonLoopInvariantCodeMotion());
     pm.addPass(mlir::createCSEPass());
     pm.addPass(mlir::createSymbolDCEPass());
 
