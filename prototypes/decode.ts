@@ -232,7 +232,7 @@ function buildGDNDecode() {
 // ── FA2 decode kernel (with RoPE + KV cache) ──
 // Grid: [NH] (8 Q heads). Each program handles one Q head (HD=256).
 // For seq=1 decode: q[1,256] attends to k_cache[T,256], v_cache[T,256]
-// ── FA2 decode: q_norm kernel (separate from attention) ──
+// ── q_norm kernel (writes normalized q to QBuf) ──
 function buildQNorm() {
   const b=new TTIRBuilder();
   const QG=b.param("QG",{ptr:"bf16"}),QNW=b.param("QNW",{ptr:"bf16"}),QN=b.param("QN",{ptr:"bf16"});
@@ -278,22 +278,158 @@ function buildFA2Attn() {
   const qOff=b.mul(head,b.i32(HD));
   const kvOff=b.mul(headKv,b.i32(HD));
   const gOff=b.add(b.mul(head,b.i32(HD*2)),b.i32(HD));
-  // Load rotated q
-  const tpQ=b.makeTensorPtr(QR,[1,NH*HD],[NH*HD,1],[b.i32(0),qOff],[1,HD],"bf16",[1,0]);
-  const q=b.fpext(b.load(tpQ,{boundaryCheck:[0,1],padding:1}),"f32");
-  // Load rotated k, store to cache
-  const tpK=b.makeTensorPtr(KR,[1,KV_DIM],[KV_DIM,1],[b.i32(0),kvOff],[1,HD],"bf16",[1,0]);
-  const k=b.fpext(b.load(tpK,{boundaryCheck:[0,1],padding:1}),"f32");
+  const q=b.fpext(b.load(b.makeTensorPtr(QR,[1,NH*HD],[NH*HD,1],[b.i32(0),qOff],[1,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const k=b.fpext(b.load(b.makeTensorPtr(KR,[1,KV_DIM],[KV_DIM,1],[b.i32(0),kvOff],[1,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
   const cacheRow=b.add(b.mul(head,b.i32(MAX_LEN)),Pos);
   b.store(b.makeTensorPtr(KC,[NH*MAX_LEN,HD],[HD,1],[cacheRow,b.i32(0)],[1,HD],"bf16",[1,0]),b.fptrunc(k,"bf16"),{boundaryCheck:[0,1]});
-  // Load v, store to cache
-  const tpV=b.makeTensorPtr(VB,[1,KV_DIM],[KV_DIM,1],[b.i32(0),kvOff],[1,HD],"bf16",[1,0]);
-  const v=b.fpext(b.load(tpV,{boundaryCheck:[0,1],padding:1}),"f32");
+  const v=b.fpext(b.load(b.makeTensorPtr(VB,[1,KV_DIM],[KV_DIM,1],[b.i32(0),kvOff],[1,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
   b.store(b.makeTensorPtr(VC,[NH*MAX_LEN,HD],[HD,1],[cacheRow,b.i32(0)],[1,HD],"bf16",[1,0]),b.fptrunc(v,"bf16"),{boundaryCheck:[0,1]});
-  // Attention: scores = sum(q * k_cache, 1) * scale
-  const tpKC=b.makeTensorPtr(KC,[NH*MAX_LEN,HD],[HD,1],[b.mul(head,b.i32(MAX_LEN)),b.i32(0)],[MAX_LEN,HD],"bf16",[1,0]);
-  const kCache=b.fpext(b.load(tpKC,{boundaryCheck:[0,1],padding:1}),"f32");
+  const kCache=b.fpext(b.load(b.makeTensorPtr(KC,[NH*MAX_LEN,HD],[HD,1],[b.mul(head,b.i32(MAX_LEN)),b.i32(0)],[MAX_LEN,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
   const qBc=b.broadcastTo(q,[MAX_LEN,HD]);
+  const scores=b.mul(b.sum(b.mul(qBc,kCache),1),b.f32(1/Math.sqrt(HD)));
+  const maskArr=b.load(b.makeTensorPtr(Mask,[1,MAX_LEN],[MAX_LEN,1],[b.i32(0),b.i32(0)],[1,MAX_LEN],"f32",[1,0]),{boundaryCheck:[0,1],padding:1});
+  const scoresMasked=b.add(b.broadcastTo(scores,[1,MAX_LEN]),maskArr);
+  const maxScore=b.max(scoresMasked,1);
+  const expScores=b.exp(b.sub(b.broadcastTo(scoresMasked,[1,MAX_LEN]),b.broadcastTo(maxScore,[1,MAX_LEN])));
+  const sumExp=b.sum(expScores,1);
+  const weights=b.divf(expScores,b.broadcastTo(sumExp,[1,MAX_LEN]));
+  const vCache=b.fpext(b.load(b.makeTensorPtr(VC,[NH*MAX_LEN,HD],[HD,1],[b.mul(head,b.i32(MAX_LEN)),b.i32(0)],[MAX_LEN,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const weightsBc=b.broadcast(b.expandDims(b.reshape(weights,[MAX_LEN]),1),[MAX_LEN,HD]);
+  const attnOut=b.sum(b.mul(weightsBc,vCache),0);
+  const gate=b.fpext(b.load(b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),gOff],[1,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const gateSig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(gate,b.f32(-1)))));
+  const out=b.mul(b.broadcastTo(attnOut,[1,HD]),gateSig);
+  b.store(b.makeTensorPtr(Out,[1,NH*HD],[NH*HD,1],[b.i32(0),qOff],[1,HD],"bf16",[1,0]),b.fptrunc(out,"bf16"),{boundaryCheck:[0,1]});
+  return b.build("fa2a",4,8);
+}
+
+// ── RoPE in-place: modify q_norm buffer directly (no CPU!) ──
+function buildRoPEInPlace() {
+  const b=new TTIRBuilder();
+  const Q=b.param("Q",{ptr:"bf16"}),CosT=b.param("C",{ptr:"f32"}),SinT=b.param("S",{ptr:"f32"});
+  const Pos=b.param("P","i32");
+  const head=b.programId(0);
+  const off=b.mul(head,b.i32(HD));
+  const q1=b.fpext(b.load(b.makeTensorPtr(Q,[1,NH*HD],[NH*HD,1],[b.i32(0),off],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const q2=b.fpext(b.load(b.makeTensorPtr(Q,[1,NH*HD],[NH*HD,1],[b.i32(0),b.add(off,b.i32(ROT_HALF))],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const cos=b.load(b.makeTensorPtr(CosT,[MAX_LEN,ROT_HALF],[ROT_HALF,1],[Pos,b.i32(0)],[1,ROT_HALF],"f32",[1,0]),{boundaryCheck:[0,1],padding:1});
+  const sin=b.load(b.makeTensorPtr(SinT,[MAX_LEN,ROT_HALF],[ROT_HALF,1],[Pos,b.i32(0)],[1,ROT_HALF],"f32",[1,0]),{boundaryCheck:[0,1],padding:1});
+  const q1Rot=b.sub(b.mul(q1,cos),b.mul(q2,sin));
+  const q2Rot=b.add(b.mul(q2,cos),b.mul(q1,sin));
+  b.store(b.makeTensorPtr(Q,[1,NH*HD],[NH*HD,1],[b.i32(0),off],[1,ROT_HALF],"bf16",[1,0]),b.fptrunc(q1Rot,"bf16"),{boundaryCheck:[0,1]});
+  b.store(b.makeTensorPtr(Q,[1,NH*HD],[NH*HD,1],[b.i32(0),b.add(off,b.i32(ROT_HALF))],[1,ROT_HALF],"bf16",[1,0]),b.fptrunc(q2Rot,"bf16"),{boundaryCheck:[0,1]});
+  return b.build("rope",4,4);
+}
+// ── RoPE in-place for k (NKV heads) ──
+function buildRoPEKInPlace() {
+  const b=new TTIRBuilder();
+  const K=b.param("K",{ptr:"bf16"}),CosT=b.param("C",{ptr:"f32"}),SinT=b.param("S",{ptr:"f32"});
+  const Pos=b.param("P","i32");
+  const head=b.programId(0);
+  const off=b.mul(head,b.i32(HD));
+  const k1=b.fpext(b.load(b.makeTensorPtr(K,[1,KV_DIM],[KV_DIM,1],[b.i32(0),off],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const k2=b.fpext(b.load(b.makeTensorPtr(K,[1,KV_DIM],[KV_DIM,1],[b.i32(0),b.add(off,b.i32(ROT_HALF))],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const cos=b.load(b.makeTensorPtr(CosT,[MAX_LEN,ROT_HALF],[ROT_HALF,1],[Pos,b.i32(0)],[1,ROT_HALF],"f32",[1,0]),{boundaryCheck:[0,1],padding:1});
+  const sin=b.load(b.makeTensorPtr(SinT,[MAX_LEN,ROT_HALF],[ROT_HALF,1],[Pos,b.i32(0)],[1,ROT_HALF],"f32",[1,0]),{boundaryCheck:[0,1],padding:1});
+  const k1Rot=b.sub(b.mul(k1,cos),b.mul(k2,sin));
+  const k2Rot=b.add(b.mul(k2,cos),b.mul(k1,sin));
+  b.store(b.makeTensorPtr(K,[1,KV_DIM],[KV_DIM,1],[b.i32(0),off],[1,ROT_HALF],"bf16",[1,0]),b.fptrunc(k1Rot,"bf16"),{boundaryCheck:[0,1]});
+  b.store(b.makeTensorPtr(K,[1,KV_DIM],[KV_DIM,1],[b.i32(0),b.add(off,b.i32(ROT_HALF))],[1,ROT_HALF],"bf16",[1,0]),b.fptrunc(k2Rot,"bf16"),{boundaryCheck:[0,1]});
+  return b.build("ropek",4,4);
+}
+
+// ── Fused FA2: q_norm+RoPE+k_norm+RoPE+KV cache+attention+gate — ALL on GPU ──
+// Grid: [NH]. No CPU round-trips.
+const PASS1 = 128, PASS2 = 64; // 64+128+64 = 256 (all powers of 2)
+function buildFA2Fused() {
+  const b=new TTIRBuilder();
+  const QG=b.param("QG",{ptr:"bf16"}),KB=b.param("K",{ptr:"bf16"}),VB=b.param("V",{ptr:"bf16"});
+  const QNW=b.param("QNW",{ptr:"bf16"}),KNW=b.param("KNW",{ptr:"bf16"});
+  const CosT=b.param("CT",{ptr:"f32"}),SinT=b.param("ST",{ptr:"f32"});
+  const QBuf=b.param("QB",{ptr:"bf16"});
+  const KC=b.param("KC",{ptr:"bf16"}),VC=b.param("VC",{ptr:"bf16"});
+  const Mask=b.param("M",{ptr:"f32"}),Out=b.param("O",{ptr:"bf16"});
+  const Pos=b.param("P","i32");
+  const head=b.programId(0);
+  const headKv=b.divi(head,b.i32(NH/NKV));
+  const qOffIn=b.mul(head,b.i32(HD*2));
+  const gOff=b.add(qOffIn,b.i32(HD));
+  const kvOff=b.mul(headKv,b.i32(HD));
+  const qOffBuf=b.mul(head,b.i32(HD));
+  const cacheRow=b.add(b.mul(head,b.i32(MAX_LEN)),Pos);
+  // ── q_norm + RoPE ──
+  // Load full q[256] for rstd
+  const tpQF=b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),qOffIn],[1,HD],"bf16",[1,0]);
+  const qF=b.fpext(b.load(tpQF,{boundaryCheck:[0,1],padding:1}),"f32");
+  const rstd=b.rsqrtHw(b.add(b.divf(b.sum(b.mul(qF,qF),1),b.f32(HD)),b.f32(EPS)));
+  // Load cos/sin for this position [1, 32]
+  const cos=b.load(b.makeTensorPtr(CosT,[MAX_LEN,ROT_HALF],[ROT_HALF,1],[Pos,b.i32(0)],[1,ROT_HALF],"f32",[1,0]),{boundaryCheck:[0,1],padding:1});
+  const sin=b.load(b.makeTensorPtr(SinT,[MAX_LEN,ROT_HALF],[ROT_HALF,1],[Pos,b.i32(0)],[1,ROT_HALF],"f32",[1,0]),{boundaryCheck:[0,1],padding:1});
+  // Helper: normalize a slice of q and apply weight
+  // q1[0:32], q2[32:64] → apply RoPE
+  const q1R=b.fpext(b.load(b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),qOffIn],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const q2R=b.fpext(b.load(b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),b.add(qOffIn,b.i32(ROT_HALF))],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const w1=b.fpext(b.load(b.makeTensorPtr(QNW,[1,ROT_HALF],[ROT_HALF,1],[b.i32(0),b.i32(0)],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const w2=b.fpext(b.load(b.makeTensorPtr(QNW,[1,ROT_HALF],[ROT_HALF,1],[b.i32(0),b.i32(ROT_HALF)],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const q1=b.mul(q1R,b.mul(rstd,b.add(b.f32(1),w1)));
+  const q2=b.mul(q2R,b.mul(rstd,b.add(b.f32(1),w2)));
+  // RoPE: non-interleaved, cos/sin duplicated in halves
+  const q1Rot=b.sub(b.mul(q1,cos),b.mul(q2,sin));
+  const q2Rot=b.add(b.mul(q2,cos),b.mul(q1,sin));
+  // Store rotated parts to QBuf
+  b.store(b.makeTensorPtr(QBuf,[1,NH*HD],[NH*HD,1],[b.i32(0),qOffBuf],[1,ROT_HALF],"bf16",[1,0]),b.fptrunc(q1Rot,"bf16"),{boundaryCheck:[0,1]});
+  b.store(b.makeTensorPtr(QBuf,[1,NH*HD],[NH*HD,1],[b.i32(0),b.add(qOffBuf,b.i32(ROT_HALF))],[1,ROT_HALF],"bf16",[1,0]),b.fptrunc(q2Rot,"bf16"),{boundaryCheck:[0,1]});
+  // Pass-through parts [64:192] and [192:256]
+  const q3R=b.fpext(b.load(b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),b.add(qOffIn,b.i32(ROT_DIM))],[1,PASS1],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const w3=b.fpext(b.load(b.makeTensorPtr(QNW,[1,PASS1],[PASS1,1],[b.i32(0),b.i32(ROT_DIM)],[1,PASS1],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const q3=b.mul(q3R,b.mul(rstd,b.add(b.f32(1),w3)));
+  b.store(b.makeTensorPtr(QBuf,[1,NH*HD],[NH*HD,1],[b.i32(0),b.add(qOffBuf,b.i32(ROT_DIM))],[1,PASS1],"bf16",[1,0]),b.fptrunc(q3,"bf16"),{boundaryCheck:[0,1]});
+  const q4R=b.fpext(b.load(b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),b.add(qOffIn,b.i32(ROT_DIM+PASS1))],[1,PASS2],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const w4=b.fpext(b.load(b.makeTensorPtr(QNW,[1,PASS2],[PASS2,1],[b.i32(0),b.i32(ROT_DIM+PASS1)],[1,PASS2],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const q4=b.mul(q4R,b.mul(rstd,b.add(b.f32(1),w4)));
+  b.store(b.makeTensorPtr(QBuf,[1,NH*HD],[NH*HD,1],[b.i32(0),b.add(qOffBuf,b.i32(ROT_DIM+PASS1))],[1,PASS2],"bf16",[1,0]),b.fptrunc(q4,"bf16"),{boundaryCheck:[0,1]});
+  // ── k_norm + RoPE (same structure, store to KV cache) ──
+  const tpKF=b.makeTensorPtr(KB,[1,KV_DIM],[KV_DIM,1],[b.i32(0),kvOff],[1,HD],"bf16",[1,0]);
+  const kF=b.fpext(b.load(tpKF,{boundaryCheck:[0,1],padding:1}),"f32");
+  const kRstd=b.rsqrtHw(b.add(b.divf(b.sum(b.mul(kF,kF),1),b.f32(HD)),b.f32(EPS)));
+  const k1R=b.fpext(b.load(b.makeTensorPtr(KB,[1,KV_DIM],[KV_DIM,1],[b.i32(0),kvOff],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const k2R=b.fpext(b.load(b.makeTensorPtr(KB,[1,KV_DIM],[KV_DIM,1],[b.i32(0),b.add(kvOff,b.i32(ROT_HALF))],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const kw1=b.fpext(b.load(b.makeTensorPtr(KNW,[1,ROT_HALF],[ROT_HALF,1],[b.i32(0),b.i32(0)],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const kw2=b.fpext(b.load(b.makeTensorPtr(KNW,[1,ROT_HALF],[ROT_HALF,1],[b.i32(0),b.i32(ROT_HALF)],[1,ROT_HALF],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const k1=b.mul(k1R,b.mul(kRstd,b.add(b.f32(1),kw1)));
+  const k2=b.mul(k2R,b.mul(kRstd,b.add(b.f32(1),kw2)));
+  const k1Rot=b.sub(b.mul(k1,cos),b.mul(k2,sin));
+  const k2Rot=b.add(b.mul(k2,cos),b.mul(k1,sin));
+  b.store(b.makeTensorPtr(KC,[NH*MAX_LEN,HD],[HD,1],[cacheRow,b.i32(0)],[1,ROT_HALF],"bf16",[1,0]),b.fptrunc(k1Rot,"bf16"),{boundaryCheck:[0,1]});
+  b.store(b.makeTensorPtr(KC,[NH*MAX_LEN,HD],[HD,1],[cacheRow,b.i32(ROT_HALF)],[1,ROT_HALF],"bf16",[1,0]),b.fptrunc(k2Rot,"bf16"),{boundaryCheck:[0,1]});
+  const k3R=b.fpext(b.load(b.makeTensorPtr(KB,[1,KV_DIM],[KV_DIM,1],[b.i32(0),b.add(kvOff,b.i32(ROT_DIM))],[1,PASS1],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const kw3=b.fpext(b.load(b.makeTensorPtr(KNW,[1,PASS1],[PASS1,1],[b.i32(0),b.i32(ROT_DIM)],[1,PASS1],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const k3=b.mul(k3R,b.mul(kRstd,b.add(b.f32(1),kw3)));
+  b.store(b.makeTensorPtr(KC,[NH*MAX_LEN,HD],[HD,1],[cacheRow,b.i32(ROT_DIM)],[1,PASS1],"bf16",[1,0]),b.fptrunc(k3,"bf16"),{boundaryCheck:[0,1]});
+  const k4R=b.fpext(b.load(b.makeTensorPtr(KB,[1,KV_DIM],[KV_DIM,1],[b.i32(0),b.add(kvOff,b.i32(ROT_DIM+PASS1))],[1,PASS2],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const kw4=b.fpext(b.load(b.makeTensorPtr(KNW,[1,PASS2],[PASS2,1],[b.i32(0),b.i32(ROT_DIM+PASS1)],[1,PASS2],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const k4=b.mul(k4R,b.mul(kRstd,b.add(b.f32(1),kw4)));
+  b.store(b.makeTensorPtr(KC,[NH*MAX_LEN,HD],[HD,1],[cacheRow,b.i32(ROT_DIM+PASS1)],[1,PASS2],"bf16",[1,0]),b.fptrunc(k4,"bf16"),{boundaryCheck:[0,1]});
+  // Store v to cache
+  const v=b.fpext(b.load(b.makeTensorPtr(VB,[1,KV_DIM],[KV_DIM,1],[b.i32(0),kvOff],[1,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  b.store(b.makeTensorPtr(VC,[NH*MAX_LEN,HD],[HD,1],[cacheRow,b.i32(0)],[1,HD],"bf16",[1,0]),b.fptrunc(v,"bf16"),{boundaryCheck:[0,1]});
+  return b.build("fa2n",4,11);
+}
+
+// ── FA2 attention (separate kernel — ensures cache stores are visible) ──
+function buildFA2Attn2() {
+  const b=new TTIRBuilder();
+  const QBuf=b.param("QB",{ptr:"bf16"}),QG=b.param("QG",{ptr:"bf16"});
+  const KC=b.param("KC",{ptr:"bf16"}),VC=b.param("VC",{ptr:"bf16"});
+  const Mask=b.param("M",{ptr:"f32"}),Out=b.param("O",{ptr:"bf16"});
+  const head=b.programId(0);
+  const qOffBuf=b.mul(head,b.i32(HD));
+  const gOff=b.add(b.mul(head,b.i32(HD*2)),b.i32(HD));
+  // Load rotated q from QBuf
+  const qRot=b.fpext(b.load(b.makeTensorPtr(QBuf,[1,NH*HD],[NH*HD,1],[b.i32(0),qOffBuf],[1,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  // Load k_cache [MAX_LEN, HD]
+  const kCache=b.fpext(b.load(b.makeTensorPtr(KC,[NH*MAX_LEN,HD],[HD,1],[b.mul(head,b.i32(MAX_LEN)),b.i32(0)],[MAX_LEN,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
+  const qBc=b.broadcastTo(qRot,[MAX_LEN,HD]);
   const scores=b.mul(b.sum(b.mul(qBc,kCache),1),b.f32(1/Math.sqrt(HD)));
   // Mask + softmax
   const maskArr=b.load(b.makeTensorPtr(Mask,[1,MAX_LEN],[MAX_LEN,1],[b.i32(0),b.i32(0)],[1,MAX_LEN],"f32",[1,0]),{boundaryCheck:[0,1],padding:1});
@@ -303,17 +439,15 @@ function buildFA2Attn() {
   const sumExp=b.sum(expScores,1);
   const weights=b.divf(expScores,b.broadcastTo(sumExp,[1,MAX_LEN]));
   // Output = weights @ v_cache
-  const tpVC=b.makeTensorPtr(VC,[NH*MAX_LEN,HD],[HD,1],[b.mul(head,b.i32(MAX_LEN)),b.i32(0)],[MAX_LEN,HD],"bf16",[1,0]);
-  const vCache=b.fpext(b.load(tpVC,{boundaryCheck:[0,1],padding:1}),"f32");
+  const vCache=b.fpext(b.load(b.makeTensorPtr(VC,[NH*MAX_LEN,HD],[HD,1],[b.mul(head,b.i32(MAX_LEN)),b.i32(0)],[MAX_LEN,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
   const weightsBc=b.broadcast(b.expandDims(b.reshape(weights,[MAX_LEN]),1),[MAX_LEN,HD]);
   const attnOut=b.sum(b.mul(weightsBc,vCache),0);
   // Gate
-  const tpG=b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),gOff],[1,HD],"bf16",[1,0]);
-  const gate=b.fpext(b.load(tpG,{boundaryCheck:[0,1],padding:1}),"f32");
+  const gate=b.fpext(b.load(b.makeTensorPtr(QG,[1,QGATE],[QGATE,1],[b.i32(0),gOff],[1,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
   const gateSig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(gate,b.f32(-1)))));
   const out=b.mul(b.broadcastTo(attnOut,[1,HD]),gateSig);
-  b.store(b.makeTensorPtr(Out,[1,NH*HD],[NH*HD,1],[b.i32(0),qOff],[1,HD],"bf16",[1,0]),b.fptrunc(out,"bf16"),{boundaryCheck:[0,1]});
-  return b.build("fa2a",4,8);
+  b.store(b.makeTensorPtr(Out,[1,NH*HD],[NH*HD,1],[b.i32(0),qOffBuf],[1,HD],"bf16",[1,0]),b.fptrunc(out,"bf16"),{boundaryCheck:[0,1]});
+  return b.build("fa2a2",4,6);
 }
 
 // CPU RoPE: rotate first rotDim dims (non-interleaved)
@@ -483,9 +617,28 @@ const kCsKV=compileAndLoad(buildCast(KV_DIM),"cs",4);
 const kConv1dD=compileAndLoad(buildConv1dDecode(),"cv1d_d",4);
 const kGDND=compileAndLoad(buildGDNDecode(),"gdn_d",4);
 const kFA2D=compileAndLoad(buildFA2Decode(),"fa2_d",4);
+const kFA2N=compileAndLoad(buildFA2Fused(),"fa2n",4);
+const kFA2A2=compileAndLoad(buildFA2Attn2(),"fa2a2",4);
+const kRoPE=compileAndLoad(buildRoPEInPlace(),"rope",4);
+const kRoPEK=compileAndLoad(buildRoPEKInPlace(),"ropek",4);
 const kQNorm=compileAndLoad(buildQNorm(),"qn",4);
 const kKNormD=compileAndLoad(buildKNormD(),"knormd",4);
 const kFA2A=compileAndLoad(buildFA2Attn(),"fa2a",4);
+// Precompute RoPE cos/sin tables [MAX_LEN, 32] f32
+const ropeCosTable=new Float32Array(MAX_LEN*ROT_HALF);
+const ropeSinTable=new Float32Array(MAX_LEN*ROT_HALF);
+for(let p=0;p<MAX_LEN;p++) for(let i=0;i<ROT_HALF;i++){
+  const freq=1/Math.pow(10000000,2*i/ROT_DIM);
+  ropeCosTable[p*ROT_HALF+i]=Math.cos(p*freq);
+  ropeSinTable[p*ROT_HALF+i]=Math.sin(p*freq);
+}
+const ropeCosD=cuAlloc(BigInt(MAX_LEN*ROT_HALF*4)); cuHtoD(ropeCosD,ropeCosTable.buffer); cuSync();
+const ropeSinD=cuAlloc(BigInt(MAX_LEN*ROT_HALF*4)); cuHtoD(ropeSinD,ropeSinTable.buffer); cuSync();
+// Pre-allocate QBuf (temp buffer for rotated q)
+const qBuf=cuAlloc(BigInt(NH*HD*2)); // reused each token
+// Pre-allocate mask buffer (reused, updated each token)
+const maskBuf=cuAlloc(BigInt(MAX_LEN*4));
+const maskData=new Float32Array(MAX_LEN);
 console.log("  done");
 
 // Embedding
@@ -612,7 +765,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       launch(kOutProj,[1,Math.ceil(H/64),1],[128,1,1],[gdnOut,wp(W,layer,"linear_attn.out_proj.weight"),attnF32],`op.${layer}`);
       //cuFree(gdnOut);
     } else {
-      // FA2 decode: q_norm → CPU RoPE → k_norm → CPU RoPE → attention
+      // FA2 decode: q_norm → GPU RoPE → k_norm → GPU RoPE → attention — ALL on GPU
       const qgF32=cuAlloc(BigInt(QGATE*4));
       launch(kQProj,[1,Math.ceil(QGATE/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.q_proj.weight"),qgF32],`qp.${layer}`);
       const kF32=cuAlloc(BigInt(KV_DIM*4));
@@ -625,37 +778,21 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       launch(kCsKV,[BLK1(KV_DIM),1,1],[128,1,1],[vF32,vB],`csV.${layer}`);
       const kB=cuAlloc(BigInt(KV_DIM*2));
       launch(kCsKV,[BLK1(KV_DIM),1,1],[128,1,1],[kF32,kB],`csK.${layer}`);
-      //cuFree(qgF32); //cuFree(kF32); //cuFree(vF32);
-      // q_norm (GPU kernel)
-      const qNormB=cuAlloc(BigInt(NH*HD*2));
-      launch(kQNorm,[NH,1,1],[128,1,1],[qgB,wp(W,layer,"self_attn.q_norm.weight"),qNormB],`qn.${layer}`);
-      // k_norm (GPU kernel)
+      // q_norm → QBuf, then GPU RoPE in-place
+      launch(kQNorm,[NH,1,1],[128,1,1],[qgB,wp(W,layer,"self_attn.q_norm.weight"),qBuf],`qn.${layer}`);
+      launch(kRoPE,[NH,1,1],[128,1,1],[qBuf,ropeCosD,ropeSinD,step],`rope.${layer}`);
+      // k_norm → kNormB, then GPU RoPE in-place
       const kNormB=cuAlloc(BigInt(KV_DIM*2));
       launch(kKNormD,[NKV,1,1],[128,1,1],[kB,wp(W,layer,"self_attn.k_norm.weight"),kNormB],`kn.${layer}`);
-      //cuFree(kB);
-      // RoPE on CPU
-      const ropeCos=new Float32Array(ROT_HALF);
-      const ropeSin=new Float32Array(ROT_HALF);
-      for(let i=0;i<ROT_HALF;i++){const freq=1/Math.pow(10000000,2*i/ROT_DIM);ropeCos[i]=Math.cos(step*freq);ropeSin[i]=Math.sin(step*freq);}
-      const hQNorm=new Uint16Array(NH*HD);
-      cuDtoH(hQNorm.buffer,qNormB,BigInt(NH*HD*2));
-      applyRoPECPU(hQNorm,ropeCos,ropeSin,NH,HD,ROT_DIM);
-      cuHtoD(qNormB,hQNorm.buffer); cuSync();
-      const hKNorm=new Uint16Array(KV_DIM);
-      cuDtoH(hKNorm.buffer,kNormB,BigInt(KV_DIM*2));
-      applyRoPECPU(hKNorm,ropeCos,ropeSin,NKV,HD,ROT_DIM);
-      cuHtoD(kNormB,hKNorm.buffer); cuSync();
-      // Attention mask
-      const maskArr=new Float32Array(MAX_LEN);
-      for(let i=0;i<=step;i++) maskArr[i]=0; for(let i=step+1;i<MAX_LEN;i++) maskArr[i]=-1e30;
-      const maskD=cuAlloc(BigInt(MAX_LEN*4)); cuHtoD(maskD,maskArr.buffer); cuSync();
-      // FA2 attention (pre-rotated q, k, v + KV cache + gate)
+      launch(kRoPEK,[NKV,1,1],[128,1,1],[kNormB,ropeCosD,ropeSinD,step],`ropek.${layer}`);
+      // Update mask
+      for(let i=0;i<=step;i++) maskData[i]=0; for(let i=step+1;i<MAX_LEN;i++) maskData[i]=-1e30;
+      cuHtoD(maskBuf,maskData.buffer);
+      // FA2 attention (pre-rotated q from QBuf, k from kNormB, v from vB)
       const fa2Out=cuAlloc(BigInt(NH*HD*2));
-      launch(kFA2A,[NH,1,1],[128,1,1],[qNormB,kNormB,vB,qgB,kvCacheK[layer],kvCacheV[layer],maskD,fa2Out,step],`fa2.${layer}`);
-      //cuFree(qgB); //cuFree(vB); //cuFree(qNormB); //cuFree(kNormB); //cuFree(maskD);
+      launch(kFA2A,[NH,1,1],[128,1,1],[qBuf,kNormB,vB,qgB,kvCacheK[layer],kvCacheV[layer],maskBuf,fa2Out,step],`fa2.${layer}`);
       // o_proj
       launch(kOProj,[1,Math.ceil(H/64),1],[128,1,1],[fa2Out,wp(W,layer,"self_attn.o_proj.weight"),attnF32],`op.${layer}`);
-      //cuFree(fa2Out);
     }
     
     // cast + residual
