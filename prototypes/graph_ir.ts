@@ -315,7 +315,7 @@ class Graph {
             const p0 = b.programId(0);
             const off = b.mul(p0, b.i32(N));
             const tp = b.makeTensorPtr(p, [1, N], [N, 1], [b.i32(0), off], groupTile, outTensor.type.dtype as any, [1, 0]);
-            const storeVal = outTensor.type.dtype === "bf16" ? b.fptrunc(output, "bf16") : output;
+            const storeVal = (outTensor.type.dtype === "bf16" && (output as any).elem !== "bf16") ? b.fptrunc(output, "bf16") : output;
             b.store(tp, storeVal, {boundaryCheck: [0, 1]});
           }
         }
@@ -362,8 +362,8 @@ class Graph {
   }
 
   private emitRmsNorm(b: TTIRBuilder, inputs: any[], params: any): any {
-    const x = inputs[0];
-    const w = inputs[1];
+    const x = b.fpext(inputs[0], "f32");
+    const w = b.fpext(inputs[1], "f32");
     const N = params.N;
     const ms = b.divf(b.sum(b.mul(x, x), 1), b.f32(N));
     const rstd = b.rsqrtHw(b.add(b.broadcast(b.expandDims(ms, 1), [1, N]), b.f32(1e-6)));
@@ -608,3 +608,24 @@ for (const k of kernels) {
   console.log(lines.slice(0, 15).join("\n") + (lines.length > 15 ? `\n  ... (${lines.length} lines total)` : ""));
 }
 console.log(`\n${kernels.length} fused kernels generated from ${g.nodes.length} nodes`);
+
+// ═══════════════════════════════════════════════════════════════════
+// Compile and test the fused kernels
+// ═══════════════════════════════════════════════════════════════════
+
+import { cuAlloc, cuHtoD, cuDtoH, cuSync, cuLaunch, compileAndLoad } from "../src/ttir";
+
+console.log("\n=== Compile fused kernels ===");
+const compiledKernels: {name: string, kernel: any, args: string[], grid: [number,number,number]}[] = [];
+let compileErrors = 0;
+for (const k of kernels) {
+  try {
+    const loaded = compileAndLoad(k.ttir, k.name, 4);
+    compiledKernels.push({ name: k.name, kernel: loaded, args: k.args, grid: k.grid });
+    console.log(`  ${k.name}: OK (${k.args.length} args, grid=[${k.grid.join(",")}])`);
+  } catch (e: any) {
+    console.log(`  ${k.name}: FAIL — ${e.message.split("\n")[0]}`);
+    compileErrors++;
+  }
+}
+console.log(`\n${compiledKernels.length}/${kernels.length} kernels compiled (${compileErrors} errors)`);
