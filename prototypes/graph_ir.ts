@@ -283,13 +283,13 @@ class Graph {
           output = this.emitGemm(b, Aptr, Bptr, node.params);
         } else {
           // Element-wise ops: resolve inputs as SSA values or load from global memory
-          const inputs = node.inputs.map(inp => this.resolveValue(b, inp, paramVals, ssa, groupTile));
+          const inputs = node.inputs.map(inp => this.resolveValue(b, inp, paramVals, ssa, groupTile, group[0].grid[1] > 1 ? 1 : 0));
           switch (node.op) {
             case "cast":
               output = node.params.to === "bf16" ? b.fptrunc(inputs[0], "bf16") : b.fpext(inputs[0], node.params.to as any);
               break;
             case "add":
-              output = b.add(inputs[0], inputs[1]);
+              output = b.add(b.fpext(inputs[0], "f32"), b.fpext(inputs[1], "f32"));
               break;
             case "rmsnorm":
               output = this.emitRmsNorm(b, inputs, node.params);
@@ -297,8 +297,13 @@ class Graph {
             case "swiglu":
               output = this.emitSwiGLU(b, inputs, node.params);
               break;
+            case "conv1d_decode":
+            case "gdn_delta_rule":
+              // Placeholder — just output zeros matching the group tile
+              output = b.zeros(groupTile, "bf16");
+              break;
             default:
-              output = b.f32(0); // placeholder for complex ops
+              output = b.f32(0); // placeholder
               break;
           }
         }
@@ -306,15 +311,17 @@ class Graph {
         // Route output: SSA value (fused away) or store to global memory
         for (const outIO of node.outputs) {
           const outTensor = this.tensors.get(outIO.tensorName)!;
+          if (outTensor.role === "state") continue; // skip state outputs in codegen prototype
           if (outTensor.isFusedAway) {
             ssa.set(outIO.tensorName, output);
           } else {
-            // Store to global memory (use group tile shape)
+            // Store to global memory (use actual tensor shape, not tile)
             const p = paramVals.get(outIO.tensorName)!;
-            const N = groupTile[1];
-            const p0 = b.programId(0);
-            const off = b.mul(p0, b.i32(N));
-            const tp = b.makeTensorPtr(p, [1, N], [N, 1], [b.i32(0), off], groupTile, outTensor.type.dtype as any, [1, 0]);
+            const tensorN = outTensor.type.shape[outTensor.type.shape.length - 1];
+            const gridAxis = group[0].grid[1] > 1 ? 1 : 0;
+            const pid = b.programId(gridAxis as 0 | 1 | 2);
+            const off = b.mul(pid, b.i32(groupTile[1]));
+            const tp = b.makeTensorPtr(p, [1, tensorN], [tensorN, 1], [b.i32(0), off], groupTile, outTensor.type.dtype as any, [1, 0]);
             const storeVal = (outTensor.type.dtype === "bf16" && (output as any).elem !== "bf16") ? b.fptrunc(output, "bf16") : output;
             b.store(tp, storeVal, {boundaryCheck: [0, 1]});
           }
@@ -336,13 +343,14 @@ class Graph {
   }
 
   // Resolve a value: SSA value if fused, else load from global memory
-  private resolveValue(b: TTIRBuilder, io: NodeIO, paramVals: Map<string, any>, ssa: Map<string, any>, tile: number[]): any {
+  private resolveValue(b: TTIRBuilder, io: NodeIO, paramVals: Map<string, any>, ssa: Map<string, any>, tile: number[], gridAxis: number = 1): any {
     if (ssa.has(io.tensorName)) return ssa.get(io.tensorName);
     const p = paramVals.get(io.tensorName)!;
     const N = tile[1];
-    const p0 = b.programId(0);
-    const off = b.mul(p0, b.i32(N));
-    const tp = b.makeTensorPtr(p, [1, io.type.shape[io.type.shape.length-1]], [io.type.shape[io.type.shape.length-1], 1], [b.i32(0), off], tile, io.type.dtype as any, [1, 0]);
+    const pid = b.programId(gridAxis as 0 | 1 | 2);
+    const off = b.mul(pid, b.i32(N));
+    const tensorN = io.type.shape[io.type.shape.length-1];
+    const tp = b.makeTensorPtr(p, [1, tensorN], [tensorN, 1], [b.i32(0), off], tile, io.type.dtype as any, [1, 0]);
     return b.load(tp, {boundaryCheck: [0, 1], padding: 1});
   }
 
@@ -629,3 +637,111 @@ for (const k of kernels) {
   }
 }
 console.log(`\n${compiledKernels.length}/${kernels.length} kernels compiled (${compileErrors} errors)`);
+
+// ═══════════════════════════════════════════════════════════════════
+// End-to-end test: fused_6 (gemm+cast+add) vs separate gemm+cast+add
+// ═══════════════════════════════════════════════════════════════════
+
+console.log("\n=== End-to-end test: fused vs separate ===");
+
+// We need the actual weight data for this test
+const stPath2 = "/tmp/qwen35_0.8b.safetensors";
+const data2 = await Bun.file(stPath2).bytes();
+const dv2 = new DataView(data2.buffer, data2.byteOffset, data2.byteLength);
+const hl2 = Number(dv2.getBigUint64(0, true));
+const hdr2 = JSON.parse(new TextDecoder().decode(data2.subarray(8, 8 + hl2)));
+const ds2 = 8 + hl2;
+const base2 = cuAlloc(BigInt(data2.length - ds2));
+cuHtoD(base2, data2.subarray(ds2)); cuSync();
+const W2 = (n: string) => { const i = hdr2[n]; if (!i) throw new Error("missing " + n); return base2 + BigInt(i.data_offsets[0]); };
+
+// Build separate GEMM (no fusion) for comparison
+const bSep = new TTIRBuilder();
+const A_s = bSep.param("A", {ptr: "bf16"}), B_s = bSep.param("B", {ptr: "bf16"}), C_s = bSep.param("C", {ptr: "f32"});
+const pM = bSep.programId(0), pN = bSep.programId(1);
+const BM = 1, BN = 64, BK = 64;
+const tpA_s = bSep.makeTensorPtr(A_s, [1, ZD], [ZD, 1], [bSep.mul(pM, bSep.i32(BM)), bSep.i32(0)], [BM, BK], "bf16", [1, 0]);
+const tpB_s = bSep.makeTensorPtr(B_s, [ZD, H], [1, ZD], [bSep.i32(0), bSep.mul(pN, bSep.i32(BN))], [BK, BN], "bf16", [0, 1]);
+const tpC_s = bSep.makeTensorPtr(C_s, [1, H], [H, 1], [bSep.mul(pM, bSep.i32(BM)), bSep.mul(pN, bSep.i32(BN))], [BM, BN], "f32", [1, 0]);
+const a0_s = bSep.zeros([BM, BN], "f32");
+const [acc_s] = bSep.forIter(bSep.index(0), bSep.index(ZD), bSep.index(BK), [a0_s, tpA_s, tpB_s], (bb, _, [a, tA, tB]) => {
+  const n = bb.dot(bb.load(tA), bb.load(tB), a);
+  return [n, bb.advance(tA, [bb.i32(0), bb.i32(BK)]), bb.advance(tB, [bb.i32(BK), bb.i32(0)])];
+});
+bSep.store(tpC_s, acc_s, {boundaryCheck: [0, 1]});
+const kSepGemm = compileAndLoad(bSep.build("sep_gemm", 4, 3), "sep_gemm", 4);
+
+// Separate cast
+const bCast = new TTIRBuilder();
+const X_c = bCast.param("X", {ptr: "f32"}), Y_c = bCast.param("Y", {ptr: "bf16"});
+const row_c = bCast.programId(0);
+const tpX_c = bCast.makeTensorPtr(X_c, [1, H], [H, 1], [bCast.i32(0), bCast.mul(row_c, bCast.i32(64))], [1, 64], "f32", [1, 0]);
+const tpY_c = bCast.makeTensorPtr(Y_c, [1, H], [H, 1], [bCast.i32(0), bCast.mul(row_c, bCast.i32(64))], [1, 64], "bf16", [1, 0]);
+bCast.store(tpY_c, bCast.fptrunc(bCast.load(tpX_c, {boundaryCheck: [0, 1], padding: 1}), "bf16"), {boundaryCheck: [0, 1]});
+const kSepCast = compileAndLoad(bCast.build("sep_cast", 4, 2), "sep_cast", 4);
+
+// Separate add
+const bAdd = new TTIRBuilder();
+const A_a = bAdd.param("A", {ptr: "bf16"}), B_a = bAdd.param("B", {ptr: "bf16"}), O_a = bAdd.param("O", {ptr: "bf16"});
+const row_a = bAdd.programId(0);
+const tpA_a = bAdd.makeTensorPtr(A_a, [1, H], [H, 1], [bAdd.i32(0), bAdd.mul(row_a, bAdd.i32(64))], [1, 64], "bf16", [1, 0]);
+const tpB_a = bAdd.makeTensorPtr(B_a, [1, H], [H, 1], [bAdd.i32(0), bAdd.mul(row_a, bAdd.i32(64))], [1, 64], "bf16", [1, 0]);
+const tpO_a = bAdd.makeTensorPtr(O_a, [1, H], [H, 1], [bAdd.i32(0), bAdd.mul(row_a, bAdd.i32(64))], [1, 64], "bf16", [1, 0]);
+const a_a = bAdd.fpext(bAdd.load(tpA_a, {boundaryCheck: [0, 1], padding: 1}), "f32");
+const bb_a = bAdd.fpext(bAdd.load(tpB_a, {boundaryCheck: [0, 1], padding: 1}), "f32");
+bAdd.store(tpO_a, bAdd.fptrunc(bAdd.add(a_a, bb_a), "bf16"), {boundaryCheck: [0, 1]});
+const kSepAdd = compileAndLoad(bAdd.build("sep_add", 4, 3), "sep_add", 4);
+
+// Allocate test data
+const gdnOutD = cuAlloc(BigInt(ZD * 2)); // bf16 input (gdnOut)
+const outProjWD = W2("model.language_model.layers.0.linear_attn.out_proj.weight");
+const xD = cuAlloc(BigInt(H * 2)); // bf16 residual (x)
+const outSepF32 = cuAlloc(BigInt(H * 4)); // f32 GEMM output
+const outSepBf = cuAlloc(BigInt(H * 2)); // bf16 cast output
+const outSepAdd = cuAlloc(BigInt(H * 2)); // bf16 add output (separate)
+const outFused = cuAlloc(BigInt(H * 2)); // bf16 fused output
+
+// Fill with random data
+const rand = new Uint16Array(ZD);
+for (let i = 0; i < ZD; i++) rand[i] = Math.random() * 65535 | 0;
+cuHtoD(gdnOutD, rand.buffer.slice(0, ZD * 2));
+const randX = new Uint16Array(H);
+for (let i = 0; i < H; i++) randX[i] = Math.random() * 65535 | 0;
+cuHtoD(xD, randX.buffer.slice(0, H * 2));
+cuSync();
+
+// Run separate: gemm → cast → add
+cuLaunch(kSepGemm, [1, Math.ceil(H / 64), 1], [128, 1, 1], [gdnOutD, outProjWD, outSepF32]);
+cuLaunch(kSepCast, [Math.ceil(H / 64), 1, 1], [128, 1, 1], [outSepF32, outSepBf]);
+cuLaunch(kSepAdd, [Math.ceil(H / 64), 1, 1], [128, 1, 1], [xD, outSepBf, outSepAdd]);
+cuSync();
+
+// Run fused: gemm+cast+add (fused_6)
+const fused6 = compiledKernels.find(k => k.name === "fused_6");
+if (fused6) {
+  cuLaunch(fused6.kernel, [1, Math.ceil(H / 64), 1], [128, 1, 1], [gdnOutD, outProjWD, xD, outFused]);
+  cuSync();
+
+  // Compare
+  const hSep = new Uint16Array(H);
+  const hFused = new Uint16Array(H);
+  cuDtoH(hSep.buffer, outSepAdd, BigInt(H * 2));
+  cuDtoH(hFused.buffer, outFused, BigInt(H * 2));
+
+  let maxDiff = 0, match = 0;
+  for (let i = 0; i < H; i++) {
+    const diff = Math.abs(hSep[i] - hFused[i]);
+    if (diff > maxDiff) maxDiff = diff;
+    if (hSep[i] === hFused[i]) match++;
+  }
+  console.log(`Separate vs Fused (gemm+cast+add):`);
+  console.log(`  Exact match: ${match}/${H} (${(match / H * 100).toFixed(1)}%)`);
+  console.log(`  Max diff: ${maxDiff}`);
+  if (maxDiff <= 1) {
+    console.log(`  ✓ PASS — fused kernel matches separate kernels`);
+  } else {
+    console.log(`  ✗ FAIL — outputs differ`);
+  }
+} else {
+  console.log("fused_6 kernel not found");
+}
