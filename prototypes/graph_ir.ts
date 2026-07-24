@@ -130,80 +130,83 @@ class Graph {
   // Fusion pass
   // ═════════════════════════════════════════════════════════════════
 
-  fuse(): GraphNode[][] {
-    // Group nodes that can be fused into a single kernel.
-    // Rules:
-    // 1. Same grid shape (or compatible)
-    // 2. Producer-consumer edge where both tensors have role "data"
-    // 3. The producer's output has no other consumers (or all are in the same group)
-    // 4. "state", "weight", "scalar" roles block fusion (must be in global memory)
+  // ═════════════════════════════════════════════════════════════════
+  // Fusion pass — vertical (producer-consumer) + horizontal (siblings)
+  // ═════════════════════════════════════════════════════════════════
 
+  fuse(): GraphNode[][] {
     const groups: GraphNode[][] = [];
     const nodeGroup = new Map<number, number>();
 
+    // Pass 1: Vertical fusion — producer-consumer chains with same grid
     for (const node of this.nodes) {
-      // Try to fuse with the most recent compatible group
       let fused = false;
-
       for (let gi = groups.length - 1; gi >= 0; gi--) {
         const group = groups[gi];
         const lastNode = group[group.length - 1];
-
-        // Check grid compatibility
         if (!this.gridsCompatible(lastNode.grid, node.grid)) continue;
 
-        // Check if there's a data edge from the group to this node
         let hasDataEdge = false;
         let allDataEdgesFusable = true;
-
         for (const inp of node.inputs) {
           const tensor = this.findTensor(inp.name, node);
-          if (!tensor || !tensor.producer) continue;
-
-          // Is the producer in this group?
+          if (!tensor?.producer) continue;
           if (group.includes(tensor.producer)) {
             hasDataEdge = true;
-            // Can we fuse this tensor away?
-            if (tensor.role !== "data") {
-              allDataEdgesFusable = false;
-            }
-            // Does the tensor have other consumers outside this group?
+            if (tensor.role !== "data") allDataEdgesFusable = false;
             const otherConsumers = tensor.consumers.filter(c => !group.includes(c) && c !== node);
-            if (otherConsumers.length > 0) {
-              allDataEdgesFusable = false;
-            }
+            if (otherConsumers.length > 0) allDataEdgesFusable = false;
           }
         }
-
         if (hasDataEdge && allDataEdgesFusable) {
-          // Fuse into this group
           group.push(node);
           nodeGroup.set(node.id, gi);
           fused = true;
           break;
         }
       }
-
       if (!fused) {
-        // Start a new group
         groups.push([node]);
         nodeGroup.set(node.id, groups.length - 1);
       }
     }
 
-    // Mark fused-away tensors (data tensors that only flow within a group)
-    for (const [name, tensor] of this.tensors) {
+    // Pass 2: Horizontal fusion — sibling GEMMs with same input + same grid
+    // Merges a_proj+b_proj, gate_proj+up_proj into single groups
+    for (let i = 0; i < groups.length; i++) {
+      if (groups[i].length !== 1) continue; // only merge single-node groups
+      const nodeA = groups[i][0];
+      if (nodeA.op !== "gemm") continue;
+      for (let j = i + 1; j < groups.length; j++) {
+        if (groups[j].length !== 1) continue;
+        const nodeB = groups[j][0];
+        if (nodeB.op !== "gemm") continue;
+        if (!this.gridsCompatible(nodeA.grid, nodeB.grid)) continue;
+        // Check if they share at least one input tensor
+        const sharedInput = nodeA.inputs.some(inpA =>
+          nodeB.inputs.some(inpB => inpA.tensorName === inpB.tensorName)
+        );
+        if (!sharedInput) continue;
+        // Merge: group j into group i, mark as dual GEMM
+        groups[i].push(nodeB);
+        nodeGroup.set(nodeB.id, i);
+        groups.splice(j, 1);
+        // Update all nodeGroup entries after j
+        for (const [nid, gid] of nodeGroup) if (gid > j) nodeGroup.set(nid, gid - 1);
+        j--; // recheck this slot
+        break;
+      }
+    }
+
+    // Mark fused-away tensors
+    for (const [, tensor] of this.tensors) {
       if (!tensor.producer || tensor.role !== "data") continue;
       const producerGroup = nodeGroup.get(tensor.producer.id);
       if (producerGroup === undefined) continue;
-
-      // Check if all consumers are in the same group as the producer
-      const allSameGroup = tensor.consumers.every(c =>
+      const allSameGroup = tensor.consumers.length > 0 && tensor.consumers.every(c =>
         nodeGroup.get(c.id) === producerGroup
       );
-      if (allSameGroup && tensor.consumers.length > 0) {
-        tensor.isFusedAway = true;
-      }
+      if (allSameGroup) tensor.isFusedAway = true;
     }
 
     return groups;

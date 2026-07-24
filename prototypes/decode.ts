@@ -59,21 +59,69 @@ function tokenize(text:string, tokPath:string):Uint32Array {
 }
 
 // ── GEMM, RMSNorm, SwiGLU, Add, Cast (same as qwen35.ts) ──
-function buildMM(M:number,N:number,K:number) {
+// ── GEMM with optional epilogue fusion (Cast, Add) ──
+// opts.cast: store output as bf16 instead of f32 (fuses Cast into GEMM)
+// opts.add: load residual (bf16), add to output before cast/store (fuses Cast+Add)
+// opts.N2: if set, compute a SECOND GEMM [M,N2,K] with same A but different B2, output to C2 (fuses Gate+Up, A+B)
+function buildMM(M:number,N:number,K:number,opts?:{cast?:boolean,add?:boolean,N2?:number}) {
   const BM=Math.min(64,M),BN=Math.min(64,N),BK=Math.min(64,K);
   const b=new TTIRBuilder();
-  const A=b.param("A",{ptr:"bf16"}),B=b.param("B",{ptr:"bf16"}),C=b.param("C",{ptr:"f32"});
+  const outElem=opts?.cast?"bf16":"f32";
+  const A=b.param("A",{ptr:"bf16"}),B=b.param("B",{ptr:"bf16"});
+  const C=b.param("C",{ptr:outElem});
+  const params=[A,B,C];
+  if(opts?.add){const R=b.param("R",{ptr:"bf16"});params.push(R);}
+  if(opts?.N2){const B2=b.param("B2",{ptr:"bf16"}),C2=b.param("C2",{ptr:outElem});params.push(B2,C2);}
   const pM=b.programId(0),pN=b.programId(1);
   const tpA=b.makeTensorPtr(A,[M,K],[K,1],[b.mul(pM,b.i32(BM)),b.i32(0)],[BM,BK],"bf16",[1,0]);
   const tpB=b.makeTensorPtr(B,[K,N],[1,K],[b.i32(0),b.mul(pN,b.i32(BN))],[BK,BN],"bf16",[0,1]);
-  const tpC=b.makeTensorPtr(C,[M,N],[N,1],[b.mul(pM,b.i32(BM)),b.mul(pN,b.i32(BN))],[BM,BN],"f32",[1,0]);
+  const tpC=b.makeTensorPtr(C,[M,N],[N,1],[b.mul(pM,b.i32(BM)),b.mul(pN,b.i32(BN))],[BM,BN],outElem,[1,0]);
+  // Residual pointer (if add epilogue)
+  let tpR:any=null;
+  if(opts?.add){const R=params[3];tpR=b.makeTensorPtr(R,[M,N],[N,1],[b.mul(pM,b.i32(BM)),b.mul(pN,b.i32(BN))],[BM,BN],"bf16",[1,0]);}
+  // Second GEMM pointers (if N2)
+  let tpB2:any=null,tpC2:any=null,BN2=0;
+  if(opts?.N2){BN2=Math.min(64,opts.N2);const B2=params[opts?.add?4:3],C2=params[opts?.add?5:4];
+    tpB2=b.makeTensorPtr(B2,[K,opts.N2],[1,K],[b.i32(0),b.mul(pN,b.i32(BN2))],[BK,BN2],"bf16",[0,1]);
+    tpC2=b.makeTensorPtr(C2,[M,opts.N2],[opts.N2,1],[b.mul(pM,b.i32(BM)),b.mul(pN,b.i32(BN2))],[BM,BN2],outElem,[1,0]);}
+  // Main GEMM
   const a0=b.zeros([BM,BN],"f32");
-  const [acc]=b.forIter(b.index(0),b.index(K),b.index(BK),[a0,tpA,tpB],(bb,_,[a,tA,tB])=>{
+  const [acc,tpA2,tpB2_] = b.forIter(b.index(0),b.index(K),b.index(BK),[a0,tpA,tpB],(bb,_,[a,tA,tB])=>{
     const n=bb.dot(bb.load(tA),bb.load(tB),a);
     return[n,bb.advance(tA,[bb.i32(0),bb.i32(BK)]),bb.advance(tB,[bb.i32(BK),bb.i32(0)])];
   });
-  b.store(tpC,acc,{boundaryCheck:[0,1]});
-  return b.build("mm",4,3);
+  // Epilogue: add residual
+  let result=acc;
+  if(opts?.add){const res=b.fpext(b.load(tpR,{boundaryCheck:[0,1],padding:1}),"f32");result=b.add(result,res);}
+  // Store (with optional cast)
+  const storeVal=opts?.cast?b.fptrunc(result,"bf16"):result;
+  b.store(tpC,storeVal,{boundaryCheck:[0,1]});
+  // Second GEMM (shares A, same K-loop)
+  if(opts?.N2){
+    const a02=b.zeros([BM,BN2],"f32");
+    const [acc2] = b.forIter(b.index(0),b.index(K),b.index(BK),[a02,tpA,tpB2],(bb,_,[a2,tA2,tB2])=>{
+      const n=bb.dot(bb.load(tA2),bb.load(tB2),a2);
+      return[n,bb.advance(tA2,[bb.i32(0),bb.i32(BK)]),bb.advance(tB2,[bb.i32(BK),bb.i32(0)])];
+    });
+    let result2=acc2;
+    const storeVal2=opts?.cast?b.fptrunc(result2,"bf16"):result2;
+    b.store(tpC2,storeVal2,{boundaryCheck:[0,1]});
+  }
+  const numParams=3+(opts?.add?1:0)+(opts?.N2?2:0);
+  return b.build("mm",4,numParams);
+}
+// ── Fused Cast+Add: y = cast(a) + b  (saves 1 launch + 1 intermediate buffer) ──
+function buildCastAdd(N:number) {
+  const b=new TTIRBuilder();
+  const A=b.param("A",{ptr:"f32"}),B=b.param("B",{ptr:"bf16"}),O=b.param("O",{ptr:"bf16"});
+  const row=b.programId(0);const BLK=Math.min(1024,N);const off=b.mul(row,b.i32(BLK));
+  const tpA=b.makeTensorPtr(A,[1,N],[N,1],[b.i32(0),off],[1,BLK],"f32",[1,0]);
+  const tpB=b.makeTensorPtr(B,[1,N],[N,1],[b.i32(0),off],[1,BLK],"bf16",[1,0]);
+  const tpO=b.makeTensorPtr(O,[1,N],[N,1],[b.i32(0),off],[1,BLK],"bf16",[1,0]);
+  const a=b.load(tpA,{boundaryCheck:[0,1],padding:1});
+  const bb=b.fpext(b.load(tpB,{boundaryCheck:[0,1],padding:1}),"f32");
+  b.store(tpO,b.fptrunc(b.add(a,bb),"bf16"),{boundaryCheck:[0,1]});
+  return b.build("ca",4,3);
 }
 function buildRMS(N:number) {
   const b=new TTIRBuilder();
@@ -678,12 +726,25 @@ console.log(`prompt: "${prompt}" → ${tokenIds.length} tokens: [${tokenIds}]`);
 
 // Compile kernels
 console.log("compiling kernels...");
-const mm=(M:number,N:number,K:number)=>compileAndLoad(buildMM(M,N,K),"mm",4);
-const kQKV=mm(1,QKVD,H), kZ=mm(1,ZD,H), kA=mm(1,LVH,H), kB=mm(1,LVH,H);
-const kOutProj=mm(1,H,ZD);
-const kQProj=mm(1,QGATE,H), kKVProj=mm(1,KV_DIM,H), kOProj=mm(1,H,NH*HD);
-const kGP=mm(1,INTER,H), kUP=mm(1,INTER,H), kDP=mm(1,H,INTER);
+// Fused GEMM variants — automatically fuse Cast/Add/dual-GEMM into the epilogue
+const mm=(M:number,N:number,K:number,opts?:any)=>compileAndLoad(buildMM(M,N,K,opts),"mm",4);
+const mmF=(M:number,N:number,K:number,opts?:any)=>compileAndLoad(buildMM(M,N,K,opts),"mm",4);
+// GDN: qkv+cast, z+cast, a+b dual-GEMM, out_proj+cast+add, down_proj+cast+add
+const kQKV=mmF(1,QKVD,H,{cast:true});                     // GEMM+Cast (output bf16)
+const kZ=mmF(1,ZD,H,{cast:true});                          // GEMM+Cast
+const kAB=mmF(1,LVH*2,H,{N2:LVH});                         // Dual GEMM (a+b) — shares input
+const kOutProj=mmF(1,H,ZD,{cast:true,add:true});           // GEMM+Cast+Add (residual)
+// FA2: q+cast, k+cast, v+cast, o+cast+add
+const kQProj=mmF(1,QGATE,H,{cast:true});                   // GEMM+Cast
+const kKVProj=mmF(1,KV_DIM,H,{cast:true});                 // GEMM+Cast (k and v)
+const kOProj=mmF(1,H,NH*HD,{cast:true,add:true});          // GEMM+Cast+Add
+// MLP: gate+up dual-GEMM, down+cast+add
+const kGPUP=mmF(1,INTER,H,{N2:INTER});                     // Dual GEMM (gate+up)
+const kDP=mmF(1,H,INTER,{cast:true,add:true});              // GEMM+Cast+Add
+// lm_head (no fusion — argmax reads f32)
 const kLM=mm(1,VOCAB,H);
+// Fused Cast+Add (for cases where GEMM isn't the producer)
+const kCastAdd=compileAndLoad(buildCastAdd(H),"ca",4);
 const kRms=compileAndLoad(buildRMS(H),"rms",4);
 const kSg=compileAndLoad(buildSwiGLU(INTER),"sg",4);
 const kAd=compileAndLoad(buildAdd(H),"ad",4);
@@ -816,25 +877,16 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
     let attnF32=palloc(H*4);
     
     if (!full) {
-      // GDN decode
-      const qkv=palloc(QKVD*4);
-      launch(kQKV,[1,Math.ceil(QKVD/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_qkv.weight"),qkv],`qkv.${layer}`);
-      const z=palloc(ZD*4);
-      launch(kZ,[1,Math.ceil(ZD/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_z.weight"),z],`z.${layer}`);
-      const aP=palloc(LVH*4);
-      launch(kA,[1,1,1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_a.weight"),aP],`a.${layer}`);
-      const bP=palloc(LVH*4);
-      launch(kB,[1,1,1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_b.weight"),bP],`b.${layer}`);
-      // Decay is now computed on the GPU (log2Hw for softplus) — no CPU round-trip needed
-      const qkvB=palloc(QKVD*2);
-      launch(kCsQKV,[BLK1(QKVD),1,1],[128,1,1],[qkv,qkvB],`csQ.${layer}`);
-      const zB=palloc(ZD*2);
-      launch(kCsZD,[BLK1(ZD),1,1],[128,1,1],[z,zB],`csZ.${layer}`);
-      pfree(qkv); pfree(z);
+      // GDN decode — fused GEMMs (Cast epilogue, dual A+B, Cast+Add for out_proj)
+      const qkvB=palloc(QKVD*2); // bf16 — GEMM+Cast outputs bf16 directly
+      launch(kQKV,[1,Math.ceil(QKVD/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_qkv.weight"),qkvB],`qkv.${layer}`);
+      const zB=palloc(ZD*2); // bf16 — GEMM+Cast
+      launch(kZ,[1,Math.ceil(ZD/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_z.weight"),zB],`z.${layer}`);
+      const aP=palloc(LVH*4); const bP=palloc(LVH*4); // f32 — dual GEMM (a+b)
+      launch(kAB,[1,1,1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_a.weight"),aP,wp(W,layer,"linear_attn.in_proj_b.weight"),bP],`ab.${layer}`);
       // Conv1d decode (with conv state)
       const convOut=palloc(QKVD*2);
       launch(kConv1dD,[BLK1(QKVD),1,1],[128,1,1],[qkvB,convStates[layer],wp(W,layer,"linear_attn.conv1d.weight"),convOut,convStatesNew[layer]],`cv1d.${layer}`);
-      // Swap conv state
       const tmpCs = convStates[layer]; convStates[layer] = convStatesNew[layer]; convStatesNew[layer] = tmpCs;
       pfree(qkvB);
       // GDN delta rule (with recurrent state)
@@ -842,23 +894,18 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       launch(kGDND,[LVH,1,1],[128,1,1],[convOut,zB,wp(W,layer,"linear_attn.A_log"),wp(W,layer,"linear_attn.dt_bias"),aP,bP,wp(W,layer,"linear_attn.norm.weight"),sStates[layer],gdnOut,sStatesNew[layer]],`gdn.${layer}`);
       const tmpSs = sStates[layer]; sStates[layer] = sStatesNew[layer]; sStatesNew[layer] = tmpSs;
       pfree(convOut); pfree(zB); pfree(aP); pfree(bP);
-      // out_proj
-      launch(kOutProj,[1,Math.ceil(H/64),1],[128,1,1],[gdnOut,wp(W,layer,"linear_attn.out_proj.weight"),attnF32],`op.${layer}`);
-      pfree(gdnOut);
+      // Fused out_proj+Cast+Add: output = bf16(gdnOut @ W + x)
+      const afterAttn=palloc(H*2); // bf16 output with residual
+      launch(kOutProj,[1,Math.ceil(H/64),1],[128,1,1],[gdnOut,wp(W,layer,"linear_attn.out_proj.weight"),afterAttn,x],`op.${layer}`);
+      pfree(gdnOut); pfree(x);
     } else {
-      // FA2 decode: q_norm → GPU RoPE → k_norm → GPU RoPE → attention — ALL on GPU
-      const qgF32=palloc(QGATE*4);
-      launch(kQProj,[1,Math.ceil(QGATE/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.q_proj.weight"),qgF32],`qp.${layer}`);
-      const kF32=palloc(KV_DIM*4);
-      launch(kKVProj,[1,Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.k_proj.weight"),kF32],`kp.${layer}`);
-      const vF32=palloc(KV_DIM*4);
-      launch(kKVProj,[1,Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.v_proj.weight"),vF32],`vp.${layer}`);
-      const qgB=palloc(QGATE*2);
-      launch(kCsQG,[BLK1(QGATE),1,1],[128,1,1],[qgF32,qgB],`csQG.${layer}`);
-      const vB=palloc(KV_DIM*2);
-      launch(kCsKV,[BLK1(KV_DIM),1,1],[128,1,1],[vF32,vB],`csV.${layer}`);
-      const kB=palloc(KV_DIM*2);
-      launch(kCsKV,[BLK1(KV_DIM),1,1],[128,1,1],[kF32,kB],`csK.${layer}`);
+      // Fused FA2: Q+Cast, K+Cast, V+Cast, O+Cast+Add — ALL on GPU
+      const qgB=palloc(QGATE*2); // bf16 — GEMM+Cast
+      launch(kQProj,[1,Math.ceil(QGATE/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.q_proj.weight"),qgB],`qp.${layer}`);
+      const vB=palloc(KV_DIM*2); // bf16 — GEMM+Cast
+      launch(kKVProj,[1,Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.v_proj.weight"),vB],`vp.${layer}`);
+      const kB=palloc(KV_DIM*2); // bf16 — GEMM+Cast
+      launch(kKVProj,[1,Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.k_proj.weight"),kB],`kp.${layer}`);
       // q_norm → QBuf, then GPU RoPE in-place
       launch(kQNorm,[NH,1,1],[128,1,1],[qgB,wp(W,layer,"self_attn.q_norm.weight"),qBuf],`qn.${layer}`);
       launch(kRoPE,[NH,1,1],[128,1,1],[qBuf,ropeCosD,ropeSinD,step],`rope.${layer}`);
@@ -872,40 +919,31 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       // FA2 attention (pre-rotated q from QBuf, k from kNormB, v from vB)
       const fa2Out=palloc(NH*HD*2);
       launch(kFA2A,[NH,1,1],[128,1,1],[qBuf,kNormB,vB,qgB,kvCacheK[layer],kvCacheV[layer],maskBuf,fa2Out,step],`fa2.${layer}`);
-      pfree(qgF32); pfree(kF32); pfree(vF32); pfree(qgB); pfree(vB); pfree(kB); pfree(kNormB);
-      // o_proj
-      launch(kOProj,[1,Math.ceil(H/64),1],[128,1,1],[fa2Out,wp(W,layer,"self_attn.o_proj.weight"),attnF32],`op.${layer}`);
-      pfree(fa2Out);
+      pfree(qgB); pfree(vB); pfree(kB); pfree(kNormB);
+      // Fused o_proj+Cast+Add: output = bf16(fa2Out @ W + x)
+      const afterAttn=palloc(H*2); // bf16 output with residual
+      launch(kOProj,[1,Math.ceil(H/64),1],[128,1,1],[fa2Out,wp(W,layer,"self_attn.o_proj.weight"),afterAttn,x],`op.${layer}`);
+      pfree(fa2Out); pfree(x);
     }
     
-    // cast + residual
-    const attnBf=palloc(H*2);
-    launch(kCs,[BLK1(H),1,1],[128,1,1],[attnF32,attnBf],`cast.${layer}`);
-    const afterAttn=palloc(H*2);
-    launch(kAd,[BLK1(H),1,1],[128,1,1],[x,attnBf,afterAttn],`add1.${layer}`);
-    pfree(x); pfree(attnF32); pfree(attnBf); pfree(normed);
+    // post_attention_layernorm (afterAttn is already bf16 from fused GEMM+Cast+Add)
+    pfree(normed);
     
     // post_attention_layernorm
     const normed2=palloc(H*2);
     launch(kRms,[1,1,1],[128,1,1],[afterAttn,wp(W,layer,"post_attention_layernorm.weight"),normed2],`rms2.${layer}`);
     
-    // MLP
-    const gate=palloc(INTER*4);
-    launch(kGP,[1,Math.ceil(INTER/64),1],[128,1,1],[normed2,wp(W,layer,"mlp.gate_proj.weight"),gate],`gp.${layer}`);
-    const up=palloc(INTER*4);
-    launch(kUP,[1,Math.ceil(INTER/64),1],[128,1,1],[normed2,wp(W,layer,"mlp.up_proj.weight"),up],`up.${layer}`);
+    // MLP — fused gate+up dual GEMM, then SwiGLU, then fused down+Cast+Add
+    const gate=palloc(INTER*4); const up=palloc(INTER*4); // f32 — dual GEMM (gate+up)
+    launch(kGPUP,[1,Math.ceil(INTER/64),1],[128,1,1],[normed2,wp(W,layer,"mlp.gate_proj.weight"),gate,wp(W,layer,"mlp.up_proj.weight"),up],`gpup.${layer}`);
+    pfree(normed2);
     const act=palloc(INTER*2);
     launch(kSg,[BLK1(INTER),1,1],[128,1,1],[gate,up,act],`sg.${layer}`);
-    pfree(gate); pfree(up); pfree(normed2);
-    const mlpOut=palloc(H*4);
-    launch(kDP,[1,Math.ceil(H/64),1],[128,1,1],[act,wp(W,layer,"mlp.down_proj.weight"),mlpOut],`dp.${layer}`);
-    pfree(act);
-    
-    const mlpBf=palloc(H*2);
-    launch(kCs,[BLK1(H),1,1],[128,1,1],[mlpOut,mlpBf],`cast2.${layer}`);
-    x=palloc(H*2);
-    launch(kAd,[BLK1(H),1,1],[128,1,1],[afterAttn,mlpBf,x],`add2.${layer}`);
-    pfree(afterAttn); pfree(mlpOut); pfree(mlpBf);
+    pfree(gate); pfree(up);
+    // Fused down_proj+Cast+Add: output = bf16(act @ W + afterAttn)
+    x=palloc(H*2); // bf16 output with residual
+    launch(kDP,[1,Math.ceil(H/64),1],[128,1,1],[act,wp(W,layer,"mlp.down_proj.weight"),x,afterAttn],`dp.${layer}`);
+    pfree(afterAttn); pfree(act);
   }
   
   // Final norm + lm_head
