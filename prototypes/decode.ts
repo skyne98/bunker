@@ -156,7 +156,8 @@ function buildConv1dDecode() {
 function buildGDNDecode() {
   const b=new TTIRBuilder();
   const ConvOut=b.param("CO",{ptr:"bf16"}),Z=b.param("Z",{ptr:"bf16"});
-  const Decay=b.param("DC",{ptr:"f32"}); // precomputed exp(g) [16] f32
+  const ALog=b.param("AL",{ptr:"f32"}),dtB=b.param("DT",{ptr:"bf16"});
+  const aP=b.param("AP",{ptr:"f32"});
   const bP=b.param("BP",{ptr:"f32"});
   const NormW=b.param("NW",{ptr:"f32"}),SState=b.param("SS",{ptr:"f32"});
   const Out=b.param("O",{ptr:"bf16"}),SStateNew=b.param("SN",{ptr:"f32"});
@@ -176,8 +177,15 @@ function buildGDNDecode() {
   const kRstd=b.rsqrtHw(b.add(b.sum(b.mul(kRaw,kRaw),1),b.f32(1e-6)));
   const qNorm=b.mul(qRaw,b.mul(qRstd,b.f32(1/Math.sqrt(LKD))));
   const kNorm=b.mul(kRaw,kRstd);
-  // Load precomputed decay (exp(g)) for this head
-  const decayExp=b.load(b.addptr(b.splatPtr(Decay,1,"f32"),head));
+  // Compute decay on GPU: g = -exp(A_log) * softplus(aP + dt_bias)
+  // softplus(x) = log(1+exp(x)) = log2(1+exp(x)) * ln(2)
+  const aVal=b.load(b.addptr(b.splatPtr(aP,1,"f32"),head));
+  const dtVal=b.fpext(b.load(b.addptr(b.splatPtr(dtB,1,"bf16"),head)),"f32");
+  const alVal=b.load(b.addptr(b.splatPtr(ALog,1,"f32"),head));
+  const sp_in=b.add(aVal,dtVal);
+  const one_plus_exp=b.add(b.f32(1),b.exp(sp_in));
+  const softplus=b.mul(b.log2Hw(one_plus_exp),b.f32(Math.LN2));
+  const decayExp=b.exp(b.mul(b.f32(-1),b.mul(b.exp(alVal),softplus)));
   
   // Load beta = sigmoid(bP[head])
   const bVal=b.load(b.addptr(b.splatPtr(bP,1,"f32"),head));
@@ -218,7 +226,7 @@ function buildGDNDecode() {
   // Store output
   const tpO=b.makeTensorPtr(Out,[1,ZD],[ZD,1],[b.i32(0),qOff],[1,LVD],"bf16",[1,0]);
   b.store(tpO,b.fptrunc(oGated,"bf16"),{boundaryCheck:[0,1]});
-  return b.build("gdn_d",4,8);
+  return b.build("gdn_d",4,10);
 }
 
 // ── FA2 decode kernel (with RoPE + KV cache) ──
@@ -432,6 +440,10 @@ function buildFA2Decode() {
 }
 
 function launch(k:any,g:number[],bl:number[],args:any[],label:string) {
+  cuLaunch(k,[g[0],g[1],g[2]] as [number,number,number],[bl[0],bl[1],bl[2]] as [number,number,number],args);
+  // No cuSync — cuDtoH/cuHtoD block implicitly. GPU ops queue on default stream.
+}
+function launchSync(k:any,g:number[],bl:number[],args:any[],label:string) {
   const rc=cuLaunch(k,[g[0],g[1],g[2]] as [number,number,number],[bl[0],bl[1],bl[2]] as [number,number,number],args);
   const sr=cuSync(); if(rc)console.log(`  [!]${label} rc=${rc}`); if(sr)console.log(`  [!]${label} sync=${sr}`);
   return rc||sr;
@@ -579,35 +591,26 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       launch(kA,[1,1,1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_a.weight"),aP],`a.${layer}`);
       const bP=cuAlloc(BigInt(LVH*4));
       launch(kB,[1,1,1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_b.weight"),bP],`b.${layer}`);
-      // Compute decay on CPU: exp(g) = exp(-exp(A_log) * softplus(aP + dt_bias))
-      const hAP=new Float32Array(LVH);
-      cuDtoH(hAP.buffer,aP,BigInt(LVH*4));
-      const decayArr=new Float32Array(LVH);
-      for(let h=0;h<LVH;h++){
-        const sp=Math.log(1+Math.exp(hAP[h]+layerDtB[layer][h]));
-        decayArr[h]=Math.exp(-Math.exp(layerALog[layer][h])*sp);
-      }
-      const decayBuf=cuAlloc(BigInt(LVH*4));
-      cuHtoD(decayBuf,decayArr.buffer); cuSync();
+      // Decay is now computed on the GPU (log2Hw for softplus) — no CPU round-trip needed
       const qkvB=cuAlloc(BigInt(QKVD*2));
       launch(kCsQKV,[BLK1(QKVD),1,1],[128,1,1],[qkv,qkvB],`csQ.${layer}`);
       const zB=cuAlloc(BigInt(ZD*2));
       launch(kCsZD,[BLK1(ZD),1,1],[128,1,1],[z,zB],`csZ.${layer}`);
-      cuFree(qkv); cuFree(z);
+      //cuFree(qkv); //cuFree(z);
       // Conv1d decode (with conv state)
       const convOut=cuAlloc(BigInt(QKVD*2));
       launch(kConv1dD,[BLK1(QKVD),1,1],[128,1,1],[qkvB,convStates[layer],wp(W,layer,"linear_attn.conv1d.weight"),convOut,convStatesNew[layer]],`cv1d.${layer}`);
       // Swap conv state
       const tmpCs = convStates[layer]; convStates[layer] = convStatesNew[layer]; convStatesNew[layer] = tmpCs;
-      cuFree(qkvB);
+      //cuFree(qkvB);
       // GDN delta rule (with recurrent state)
       const gdnOut=cuAlloc(BigInt(ZD*2));
-      launch(kGDND,[LVH,1,1],[128,1,1],[convOut,zB,decayBuf,bP,wp(W,layer,"linear_attn.norm.weight"),sStates[layer],gdnOut,sStatesNew[layer]],`gdn.${layer}`);
+      launch(kGDND,[LVH,1,1],[128,1,1],[convOut,zB,wp(W,layer,"linear_attn.A_log"),wp(W,layer,"linear_attn.dt_bias"),aP,bP,wp(W,layer,"linear_attn.norm.weight"),sStates[layer],gdnOut,sStatesNew[layer]],`gdn.${layer}`);
       const tmpSs = sStates[layer]; sStates[layer] = sStatesNew[layer]; sStatesNew[layer] = tmpSs;
-      cuFree(convOut); cuFree(zB); cuFree(aP); cuFree(bP); cuFree(decayBuf);
+      //cuFree(convOut); //cuFree(zB); //cuFree(aP); //cuFree(bP);
       // out_proj
       launch(kOutProj,[1,Math.ceil(H/64),1],[128,1,1],[gdnOut,wp(W,layer,"linear_attn.out_proj.weight"),attnF32],`op.${layer}`);
-      cuFree(gdnOut);
+      //cuFree(gdnOut);
     } else {
       // FA2 decode: q_norm → CPU RoPE → k_norm → CPU RoPE → attention
       const qgF32=cuAlloc(BigInt(QGATE*4));
@@ -622,14 +625,14 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       launch(kCsKV,[BLK1(KV_DIM),1,1],[128,1,1],[vF32,vB],`csV.${layer}`);
       const kB=cuAlloc(BigInt(KV_DIM*2));
       launch(kCsKV,[BLK1(KV_DIM),1,1],[128,1,1],[kF32,kB],`csK.${layer}`);
-      cuFree(qgF32); cuFree(kF32); cuFree(vF32);
+      //cuFree(qgF32); //cuFree(kF32); //cuFree(vF32);
       // q_norm (GPU kernel)
       const qNormB=cuAlloc(BigInt(NH*HD*2));
       launch(kQNorm,[NH,1,1],[128,1,1],[qgB,wp(W,layer,"self_attn.q_norm.weight"),qNormB],`qn.${layer}`);
       // k_norm (GPU kernel)
       const kNormB=cuAlloc(BigInt(KV_DIM*2));
       launch(kKNormD,[NKV,1,1],[128,1,1],[kB,wp(W,layer,"self_attn.k_norm.weight"),kNormB],`kn.${layer}`);
-      cuFree(kB);
+      //cuFree(kB);
       // RoPE on CPU
       const ropeCos=new Float32Array(ROT_HALF);
       const ropeSin=new Float32Array(ROT_HALF);
@@ -649,10 +652,10 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       // FA2 attention (pre-rotated q, k, v + KV cache + gate)
       const fa2Out=cuAlloc(BigInt(NH*HD*2));
       launch(kFA2A,[NH,1,1],[128,1,1],[qNormB,kNormB,vB,qgB,kvCacheK[layer],kvCacheV[layer],maskD,fa2Out,step],`fa2.${layer}`);
-      cuFree(qgB); cuFree(vB); cuFree(qNormB); cuFree(kNormB); cuFree(maskD);
+      //cuFree(qgB); //cuFree(vB); //cuFree(qNormB); //cuFree(kNormB); //cuFree(maskD);
       // o_proj
       launch(kOProj,[1,Math.ceil(H/64),1],[128,1,1],[fa2Out,wp(W,layer,"self_attn.o_proj.weight"),attnF32],`op.${layer}`);
-      cuFree(fa2Out);
+      //cuFree(fa2Out);
     }
     
     // cast + residual
@@ -660,7 +663,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
     launch(kCs,[BLK1(H),1,1],[128,1,1],[attnF32,attnBf],`cast.${layer}`);
     const afterAttn=cuAlloc(BigInt(H*2));
     launch(kAd,[BLK1(H),1,1],[128,1,1],[x,attnBf,afterAttn],`add1.${layer}`);
-    cuFree(x); cuFree(attnF32); cuFree(attnBf); cuFree(normed);
+    //cuFree(x); //cuFree(attnF32); //cuFree(attnBf); //cuFree(normed);
     
     // post_attention_layernorm
     const normed2=cuAlloc(BigInt(H*2));
@@ -673,16 +676,16 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
     launch(kUP,[1,Math.ceil(INTER/64),1],[128,1,1],[normed2,wp(W,layer,"mlp.up_proj.weight"),up],`up.${layer}`);
     const act=cuAlloc(BigInt(INTER*2));
     launch(kSg,[BLK1(INTER),1,1],[128,1,1],[gate,up,act],`sg.${layer}`);
-    cuFree(gate); cuFree(up); cuFree(normed2);
+    //cuFree(gate); //cuFree(up); //cuFree(normed2);
     const mlpOut=cuAlloc(BigInt(H*4));
     launch(kDP,[1,Math.ceil(H/64),1],[128,1,1],[act,wp(W,layer,"mlp.down_proj.weight"),mlpOut],`dp.${layer}`);
-    cuFree(act);
+    //cuFree(act);
     
     const mlpBf=cuAlloc(BigInt(H*2));
     launch(kCs,[BLK1(H),1,1],[128,1,1],[mlpOut,mlpBf],`cast2.${layer}`);
     x=cuAlloc(BigInt(H*2));
     launch(kAd,[BLK1(H),1,1],[128,1,1],[afterAttn,mlpBf,x],`add2.${layer}`);
-    cuFree(afterAttn); cuFree(mlpOut); cuFree(mlpBf);
+    //cuFree(afterAttn); //cuFree(mlpOut); //cuFree(mlpBf);
   }
   
   // Final norm + lm_head
@@ -695,7 +698,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
   // argmax
   const hLog=new Float32Array(VOCAB);
   cuDtoH(hLog.buffer,logits,BigInt(VOCAB*4));
-  cuFree(x); cuFree(fn); cuFree(logits);
+  //cuFree(x); //cuFree(fn); //cuFree(logits);
   let bestId=0,bestLog=-Infinity;
   for(let i=0;i<VOCAB;i++) if(hLog[i]>bestLog){bestLog=hLog[i];bestId=i;}
   

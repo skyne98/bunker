@@ -740,6 +740,11 @@ export class TTIRBuilder {
   rsqrtHw(a: Value): Value {
     return this.inlineAsm("rsqrt.approx.f32 $0, $1;", "=f, f", [a], a.type.shape, a.elem as ScalarElem);
   }
+
+  /** Hardware log2 via PTX `lg2.approx.f32` — no libdevice needed. */
+  log2Hw(a: Value): Value {
+    return this.inlineAsm("lg2.approx.f32 $0, $1;", "=f, f", [a], a.type.shape, a.elem as ScalarElem);
+  }
   sin(a: Value): Value { return this.math1(a, "sin"); }
   cos(a: Value): Value { return this.math1(a, "cos"); }
   tanh(a: Value): Value { return this.math1(a, "tanh"); }
