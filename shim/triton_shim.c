@@ -238,14 +238,20 @@ const char* triton_compile_targeted(const char* ttir_mlir, int num_warps,
   if (auto shmemAttr = module->getOperation()->getAttrOfType<mlir::IntegerAttr>("ttg.shared"))
     g_last_shmem_size = shmemAttr.getInt();
 
-  // Debug: dump the module after passes
-  std::string debugStr;
-  llvm::raw_string_ostream debugStream(debugStr);
-  module.get()->print(debugStream);
-  debugStream.flush();
-  // Check if tt.func is still present
-  if (debugStr.find("tt.func") != std::string::npos) {
-    return strdup(("ERROR: tt.func still present after pipeline:\n" + debugStr).c_str());
+  // Sanity check: tt.func must be fully lowered by now (it survives only on
+  // a broken pipeline). The full module dump is gated behind TRITON_SHIM_LOG
+  // so the hot path never prints the whole IR.
+  if (module->getOperation()->walk([&](mlir::triton::FuncOp op) {
+        return mlir::WalkResult::interrupt();
+      }).wasInterrupted()) {
+    if (getenv("TRITON_SHIM_LOG")) {
+      std::string debugStr;
+      llvm::raw_string_ostream debugStream(debugStr);
+      module.get()->print(debugStream);
+      debugStream.flush();
+      return strdup(("ERROR: tt.func still present after pipeline:\n" + debugStr).c_str());
+    }
+    return strdup("ERROR: tt.func still present after pipeline (set TRITON_SHIM_LOG=1 for IR)");
   }
 
   // Translate to LLVM IR
