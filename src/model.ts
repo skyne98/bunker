@@ -46,6 +46,7 @@ const gy = (N: number) => Math.ceil(N / 64);
 export function buildModelGraph(): Graph {
   const g = new Graph();
   const Tk = g.input("token_id", { shape: [], dtype: "i32", strides: [] }, "scalar");
+  const Pos = g.input("pos", { shape: [], dtype: "i32", strides: [] }, "scalar");
   const embed_w = g.input("embed.weight", w([VOCAB, H]), "weight");
 
   // ── Embedding ──
@@ -81,7 +82,7 @@ export function buildModelGraph(): Graph {
         ],
         [
           { name: "out", type: w([1, QKVD]) },
-          { name: "state_new", type: { shape: [3, QKVD], dtype: "bf16", strides: [QKVD, 1] }, role: "state" },
+          { name: `${L(layer)}.conv_state_new`, type: { shape: [3, QKVD], dtype: "bf16", strides: [QKVD, 1] }, role: "state" },
         ],
         [Math.ceil(QKVD / 1024), 1, 1], { QKVD });
       const aP = g.node("gemm",
@@ -103,7 +104,7 @@ export function buildModelGraph(): Graph {
         ],
         [
           { name: "out", type: w([1, ZD]) },
-          { name: "s_state_new", type: { shape: [LVH, D.LKD, LVD], dtype: "f32", strides: [D.LKD * LVD, LVD, 1] }, role: "state" },
+          { name: `${L(layer)}.s_state_new`, type: { shape: [LVH, D.LKD, LVD], dtype: "f32", strides: [D.LKD * LVD, LVD, 1] }, role: "state" },
         ],
         [LVH, 1, 1], { LVH, LKD: D.LKD, LVD, QKVD, KEYDIM: LVH * D.LKD, ZD });
       const outProj = g.node("gemm",
@@ -131,14 +132,14 @@ export function buildModelGraph(): Graph {
       // q_buf is produced by qnorm, consumed by rope (in-place) and fa2_attn
       const ropeQ = g.node("rope",
         [{ tensor: loc(g, qNorm, "out"), name: "Q" }, { tensor: g.input(`rope_cos`, f32sh([MAX_LEN, D.ROT_HALF]), "weight"), name: "C" },
-         { tensor: g.input(`rope_sin`, f32sh([MAX_LEN, D.ROT_HALF]), "weight"), name: "S" }, { tensor: Tk, name: "P" }],
+         { tensor: g.input(`rope_sin`, f32sh([MAX_LEN, D.ROT_HALF]), "weight"), name: "S" }, { tensor: Pos, name: "P" }],
         [], [NH, 1, 1], { HD, NH, ROT_HALF: D.ROT_HALF, MAX_LEN });
       const kNorm = g.node("knorm",
         [{ tensor: loc(g, kp), name: "k" }, { tensor: g.input(`${L(layer)}.self_attn.k_norm.weight`, w([HD]), "weight"), name: "w" }],
         [{ name: "out", type: w([1, D.KV_DIM]) }], [NKV, 1, 1], { HD, NKV });
       const ropeK = g.node("ropek",
         [{ tensor: loc(g, kNorm, "out"), name: "K" }, { tensor: g.input(`rope_cos`, f32sh([MAX_LEN, D.ROT_HALF]), "weight"), name: "C" },
-         { tensor: g.input(`rope_sin`, f32sh([MAX_LEN, D.ROT_HALF]), "weight"), name: "S" }, { tensor: Tk, name: "P" }],
+         { tensor: g.input(`rope_sin`, f32sh([MAX_LEN, D.ROT_HALF]), "weight"), name: "S" }, { tensor: Pos, name: "P" }],
         [], [NKV, 1, 1], { HD, NKV, ROT_HALF: D.ROT_HALF, MAX_LEN });
       const fa2 = g.node("fa2_attn",
         [
@@ -146,12 +147,12 @@ export function buildModelGraph(): Graph {
           { tensor: loc(g, qp), name: "qgate" },
           { tensor: g.input(`${L(layer)}.kv_k_in`, { shape: [NH * MAX_LEN, HD], dtype: "bf16", strides: [HD, 1] }, "state"), name: "kc_in" },
           { tensor: g.input(`${L(layer)}.kv_v_in`, { shape: [NH * MAX_LEN, HD], dtype: "bf16", strides: [HD, 1] }, "state"), name: "vc_in" },
-          { tensor: Tk, name: "P" },
+          { tensor: Pos, name: "P" },
         ],
         [
           { name: "out", type: w([1, NH * HD]) },
-          { name: "kv_k_new", type: { shape: [NH * MAX_LEN, HD], dtype: "bf16", strides: [HD, 1] }, role: "state" },
-          { name: "kv_v_new", type: { shape: [NH * MAX_LEN, HD], dtype: "bf16", strides: [HD, 1] }, role: "state" },
+          { name: `${L(layer)}.kv_k_new`, type: { shape: [NH * MAX_LEN, HD], dtype: "bf16", strides: [HD, 1] }, role: "state" },
+          { name: `${L(layer)}.kv_v_new`, type: { shape: [NH * MAX_LEN, HD], dtype: "bf16", strides: [HD, 1] }, role: "state" },
         ],
         [NH, 1, 1], { HD, NH, MAX_LEN, NKV });
       const oProj = g.node("gemm",

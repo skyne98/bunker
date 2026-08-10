@@ -33,13 +33,14 @@ export function emitEmbed(ctx: EmitCtx, n: GraphNode): undefined {
   const E = inP(ctx, n, 0);
   const IDp = inP(ctx, n, 1);
   const X = outP(ctx, n, 0);
+  const Vocab = n.inputs[0].type.shape[0];
   const Hh = n.params.H;
   // token id is a scalar i32 kernel arg
   const id0 = IDp.isScalar ? IDp : b.load(b.makeTensorPtr(IDp, [1], [1], [b.i32(0)], [1], "i32", [1]), {});
-  const idx = b.arange(0, Hh);
-  const row = b.broadcastTo(b.mul(id0, b.i32(Hh)), [Hh]);
-  const offs = b.add(idx, row);
-  b.store(b.splatPtr(X, Hh, "bf16"), b.load(b.addptr(b.splatPtr(E, Hh, "bf16"), offs), {}), {});
+  // tiled gather: one CTA, tile [1,Hh] = the full row; start offset [id0, 0]
+  const tpE = b.makeTensorPtr(E, [Vocab, Hh], [Hh, 1], [id0, b.i32(0)], [1, Hh], "bf16", [1, 0]);
+  const tpX = b.makeTensorPtr(X, [1, Hh], [Hh, 1], [b.i32(0), b.i32(0)], [1, Hh], "bf16", [1, 0]);
+  b.store(tpX, b.load(tpE, {}), {});
   return undefined;
 }
 
