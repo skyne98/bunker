@@ -2,8 +2,37 @@
 // Generates text token-by-token with proper state carry for GDN (recurrent state + conv state)
 // and FA2 (KV cache + RoPE).
 //   TOKENIZER_PATH=/tmp/tokenizer.json SAFETENSORS_PATH=/tmp/qwen35_0.8b.safetensors bun run prototypes/decode.ts "Hello"
-import { TTIRBuilder, compileAndLoad, cuAlloc, cuHtoD, cuDtoH, cuFree, cuSync, cuLaunch } from "../src/ttir";
+import { TTIRBuilder, compileAndLoad, cuAlloc, cuHtoD as _cuHtoD, cuDtoH as _cuDtoH, cuFree, cuSync as _cuSync, cuLaunch as _cuLaunch } from "../src/ttir";
 import { dlopen, ptr as ffiPtr } from "bun:ffi";
+import { performance } from "perf_hooks";
+
+// ── Opt-in profiler (BUNKER_PROFILE=1): counts + per-call timing of every
+//    runtime primitive, and reports where the per-token time goes. This is
+//    the before/after metric for the sync-removal work.
+const __PROF = process.env.BUNKER_PROFILE === "1";
+const P = { launch: 0, sync: 0, htod: 0, dtoh: 0, launch_ns: 0n, sync_ns: 0n, htod_ns: 0n, dtoh_ns: 0n };
+let p0 = performance.now();
+function pmark(c: any, key: string, ns: number) { c[key] = c[key] + 1; c[key + "_ns"] = c[key + "_ns"] + BigInt(Math.round(ns)); }
+const cuHtoD = (a: any, b: any, c?: any) => { const t = performance.now(); _cuHtoD(a, b, c); if (__PROF) pmark(P, "htod", (performance.now() - t) * 1e6); };
+const cuDtoH = (a: any, b: any, c?: any) => { const t = performance.now(); _cuDtoH(a, b, c); if (__PROF) pmark(P, "dtoh", (performance.now() - t) * 1e6); };
+const cuSync = () => { const t = performance.now(); const r = _cuSync(); if (__PROF) pmark(P, "sync", (performance.now() - t) * 1e6); return r; };
+const cuLaunch = (k: any, g: any, bl: any, a: any) => { const t = performance.now(); const r = _cuLaunch(k, g, bl, a); if (__PROF) pmark(P, "launch", (performance.now() - t) * 1e6); return r; };
+function profReset() { P.launch=0; P.sync=0; P.htod=0; P.dtoh=0; P.launch_ns=0n; P.sync_ns=0n; P.htod_ns=0n; P.dtoh_ns=0n; }
+function profReport() {
+  const dt = performance.now() - p0;
+  const f = (n: bigint) => (Number(n) / 1e6).toFixed(2) + "ms";
+  console.log("\n── BUNKER_PROFILE ────────────────────────────");
+  console.log(`  totaling  ${dt.toFixed(1)}ms`);
+  console.log(`  launches: ${P.launch} (${f(P.launch_ns)})`);
+  console.log(`  syncs:    ${P.sync} (${f(P.sync_ns)})`);
+  console.log(`  htod:     ${P.htod} (${f(P.htod_ns)})`);
+  console.log(`  dtoh:     ${P.dtoh} (${f(P.dtoh_ns)})`);
+  console.log(`  ── CPU-side time by category (share of total) ──`);
+  const cpu = P.launch_ns + P.sync_ns + P.htod_ns + P.dtoh_ns;
+  console.log(`  primitives: ${(Number(cpu) / 1e6).toFixed(1)}ms (${(Number(cpu) / (dt * 1e6) * 100).toFixed(0)}% of total)`);
+  console.log(`  non-primitive (module code, palloc, etc): ${(dt - Number(cpu) / 1e6).toFixed(1)}ms`);
+  console.log(`───────────────────────────────────────────────`);
+}
 
 // ── Memory pool: eliminate cuAlloc overhead ──
 const _pool = new Map<number, bigint[]>();
@@ -174,6 +203,22 @@ function buildCast(N:number) {
   return b.build("cs",4,3);
 }
 
+// ── GPU embedding gather: X[i] = E[id*H + i] (bf16) ──
+// Replaces the per-token CPU read + synchronous HtoD (which dominated decode
+// latency: ~70% of wall time measured). Grid = [1], program id 0 = token id.
+// Explicit pointer-tensor form: per-element base + id*H + arange.
+function buildEmbed() {
+  const b=new TTIRBuilder();
+  const E=b.param("E",{ptr:"bf16"});   // [VOCAB, H] row-major
+  const X=b.param("X",{ptr:"bf16"});   // [H] flat
+  const ID=b.param("ID","i32");        // scalar token id (like FA2 Pos)
+  const Hh=1024;
+  const tpE=b.makeTensorPtr(E,[VOCAB,Hh],[Hh,1],[ID,b.i32(0)],[1,Hh],"bf16",[1,0]);
+  const tpX=b.makeTensorPtr(X,[1,Hh],[Hh,1],[b.i32(0),b.i32(0)],[1,Hh],"bf16",[1,0]);
+  b.store(tpX,b.load(tpE,{}),{});
+  return b.build("emb",4,3);
+}
+
 // ── Conv1d decode kernel (with conv state) ──
 // Grid: [BLK1(QKVD)]. Each program processes 1024 channels.
 // conv_out[c] = silu(w0*s0 + w1*s1 + w2*s2 + w3*current)
@@ -338,7 +383,7 @@ function buildFA2Attn() {
   const QR=b.param("QR",{ptr:"bf16"}),KR=b.param("KR",{ptr:"bf16"}),VB=b.param("V",{ptr:"bf16"});
   const QG=b.param("QG",{ptr:"bf16"});
   const KC=b.param("KC",{ptr:"bf16"}),VC=b.param("VC",{ptr:"bf16"});
-  const Mask=b.param("M",{ptr:"f32"}),Out=b.param("O",{ptr:"bf16"});
+  const Out=b.param("O",{ptr:"bf16"});
   const Pos=b.param("P","i32");
   const head=b.programId(0);
   const headKv=b.divi(head,b.i32(NH/NKV));
@@ -354,7 +399,11 @@ function buildFA2Attn() {
   const kCache=b.fpext(b.load(b.makeTensorPtr(KC,[NH*MAX_LEN,HD],[HD,1],[b.mul(head,b.i32(MAX_LEN)),b.i32(0)],[MAX_LEN,HD],"bf16",[1,0]),{boundaryCheck:[0,1],padding:1}),"f32");
   const qBc=b.broadcastTo(q,[MAX_LEN,HD]);
   const scores=b.mul(b.sum(b.mul(qBc,kCache),1),b.f32(1/Math.sqrt(HD)));
-  const maskArr=b.load(b.makeTensorPtr(Mask,[1,MAX_LEN],[MAX_LEN,1],[b.i32(0),b.i32(0)],[1,MAX_LEN],"f32",[1,0]),{boundaryCheck:[0,1],padding:1});
+  // Inline causal mask: sel(j <= Pos, 0, -1e30) — no per-token host transfer.
+  const ar=b.arange(0,MAX_LEN);                 // [128] i32
+  const le= b.le(ar,b.broadcastTo(Pos,[MAX_LEN])); // [128] i1
+  const selArr=b.select(le,b.splat(b.f32(0),[MAX_LEN],"f32"),b.splat(b.f32(-1e30),[MAX_LEN],"f32")); // [128] f32
+  const maskArr=b.broadcastTo(selArr,[1,MAX_LEN]); // [1,128] f32
   const scoresMasked=b.add(b.broadcastTo(scores,[1,MAX_LEN]),maskArr);
   const maxScore=b.max(scoresMasked,1);
   const expScores=b.exp(b.sub(b.broadcastTo(scoresMasked,[1,MAX_LEN]),b.broadcastTo(maxScore,[1,MAX_LEN])));
@@ -367,7 +416,7 @@ function buildFA2Attn() {
   const gateSig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(gate,b.f32(-1)))));
   const out=b.mul(b.broadcastTo(attnOut,[1,HD]),gateSig);
   b.store(b.makeTensorPtr(Out,[1,NH*HD],[NH*HD,1],[b.i32(0),qOff],[1,HD],"bf16",[1,0]),b.fptrunc(out,"bf16"),{boundaryCheck:[0,1]});
-  return b.build("fa2a",4,8);
+  return b.build("fa2a",4,7);
 }
 
 // ── RoPE in-place: modify q_norm buffer directly (no CPU!) ──
@@ -764,6 +813,7 @@ const kQNorm=compileAndLoad(buildQNorm(),"qn",4);
 const kKNormD=compileAndLoad(buildKNormD(),"knormd",4);
 const kFA2A=compileAndLoad(buildFA2Attn(),"fa2a",4);
 const kArgmax=compileAndLoad(buildArgmax(),"argmax",4);
+const kEmb=compileAndLoad(buildEmbed(),"emb",4);
 const argmaxVal=cuAlloc(BigInt(4)); // f32 max value
 const argmaxIdx=cuAlloc(BigInt(4)); // i32 argmax index
 // Precompute RoPE cos/sin tables [MAX_LEN, 32] f32
@@ -778,9 +828,6 @@ const ropeCosD=cuAlloc(BigInt(MAX_LEN*ROT_HALF*4)); cuHtoD(ropeCosD,ropeCosTable
 const ropeSinD=cuAlloc(BigInt(MAX_LEN*ROT_HALF*4)); cuHtoD(ropeSinD,ropeSinTable.buffer); cuSync();
 // Pre-allocate QBuf (temp buffer for rotated q)
 const qBuf=cuAlloc(BigInt(NH*HD*2)); // reused each token
-// Pre-allocate mask buffer (reused, updated each token)
-const maskBuf=cuAlloc(BigInt(MAX_LEN*4));
-const maskData=new Float32Array(MAX_LEN);
 console.log("  done");
 
 // Embedding
@@ -855,6 +902,7 @@ const kvCacheVNew = new Array(NL).fill(0).map(()=>cuAlloc(BigInt(NH*HD*MAX_LEN*2
 
 let x:bigint;
 const fStart = performance.now();
+if (__PROF) { profReset(); p0 = fStart; }
 
 for (let step = 0; step < tokenIds.length + genLen; step++) {
   const tokenId = allTokens[step];
@@ -862,10 +910,9 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
   // For step 0..tokenIds.length-1: process prompt tokens
   // For step tokenIds.length..: generate new tokens
   
-  // Embed current token
-  const emb = getEmbedding(tokenId);
+  // Embed current token — GPU gather kernel (scalar ID, no host copy)
   x = palloc(H*2);
-  cuHtoD(x, emb.buffer); cuSync();
+  cuLaunch(kEmb,[1,1,1],[128,1,1],[embedW,x,tokenId],`emb`);
   
   // Forward pass (1 token, with state carry)
   for (let layer=0; layer<NL; layer++) {
@@ -913,12 +960,10 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       const kNormB=palloc(KV_DIM*2);
       launch(kKNormD,[NKV,1,1],[128,1,1],[kB,wp(W,layer,"self_attn.k_norm.weight"),kNormB],`kn.${layer}`);
       launch(kRoPEK,[NKV,1,1],[128,1,1],[kNormB,ropeCosD,ropeSinD,step],`ropek.${layer}`);
-      // Update mask
-      for(let i=0;i<=step;i++) maskData[i]=0; for(let i=step+1;i<MAX_LEN;i++) maskData[i]=-1e30;
-      cuHtoD(maskBuf,maskData.buffer);
-      // FA2 attention (pre-rotated q from QBuf, k from kNormB, v from vB)
+      // FA2 attention (pre-rotated q from QBuf, k from kNormB, v from vB; causal
+      // mask computed inside the kernel from Pos — no host transfer)
       const fa2Out=palloc(NH*HD*2);
-      launch(kFA2A,[NH,1,1],[128,1,1],[qBuf,kNormB,vB,qgB,kvCacheK[layer],kvCacheV[layer],maskBuf,fa2Out,step],`fa2.${layer}`);
+      launch(kFA2A,[NH,1,1],[128,1,1],[qBuf,kNormB,vB,qgB,kvCacheK[layer],kvCacheV[layer],fa2Out,step],`fa2.${layer}`);
       pfree(qgB); pfree(vB); pfree(kB); pfree(kNormB);
       // Fused o_proj+Cast+Add: output = bf16(fa2Out @ W + x)
       afterAttn=palloc(H*2); // bf16 output with residual
@@ -951,11 +996,9 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
   launch(kRms,[1,1,1],[128,1,1],[x,W.get("model.language_model.norm.weight")!,fn],`rmsF`);
   const logits=palloc(VOCAB*4);
   launch(kLM,[1,Math.ceil(VOCAB/64),1],[128,1,1],[fn,embedW,logits],`lmHead`);
-  cuSync();
-  
-  // GPU argmax — no 1MB download, just 4 bytes
+
+  // GPU argmax — no 1MB download, just 4 bytes (blocking cuDtoH later syncs)
   launch(kArgmax,[1,1,1],[128,1,1],[logits,argmaxVal,argmaxIdx],`argmax`);
-  cuSync();
   pfree(x); pfree(fn); pfree(logits);
   const idxBuf=new Int32Array(1);
   cuDtoH(idxBuf.buffer,argmaxIdx,BigInt(4));
@@ -978,6 +1021,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
 const dt=(performance.now()-fStart)/1000;
 console.log(`\nGenerated ${genLen} tokens in ${dt.toFixed(1)}s (${(genLen/dt).toFixed(1)} tok/s)`);
 console.log(`Pool: ${_allocCount} allocs, ${_poolHits} pool hits (hit rate: ${(_poolHits/(_allocCount+_poolHits)*100).toFixed(0)}%)`);
+if (__PROF) profReport();
 console.log(`\n=== Generated Text ===`);
 
 // Decode tokens to text using the tokenizer (we need to reverse the tokenization)

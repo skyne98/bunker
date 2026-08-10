@@ -207,6 +207,10 @@ export function cu() {
       cuMemAlloc_v2: { args: ["ptr", "i64"], returns: "i32" },
       cuMemcpyHtoD_v2: { args: ["i64", "ptr", "i64"], returns: "i32" },
       cuMemcpyDtoH_v2: { args: ["ptr", "i64", "i64"], returns: "i32" },
+      cuMemcpyHtoDAsync_v2: { args: ["i64", "ptr", "i64", "i64"], returns: "i32" },
+      cuMemcpyDtoHAsync_v2: { args: ["ptr", "i64", "i64", "i64"], returns: "i32" },
+      cuStreamCreate: { args: ["ptr", "u32"], returns: "i32" },
+      cuStreamSynchronize: { args: ["i64"], returns: "i32" },
       cuLaunchKernel: { args: ["i64", "u32", "u32", "u32", "u32", "u32", "u32", "u32", "ptr", "ptr", "ptr"], returns: "i32" },
       cuCtxSynchronize: { args: [], returns: "i32" },
       cuMemFree_v2: { args: ["i64"], returns: "i32" },
@@ -248,6 +252,39 @@ export function cuDtoH(hostBuf: Buffer | ArrayBuffer, devPtr: bigint, bytes?: nu
 export function cuFree(devPtr: bigint): void { cu().cuMemFree_v2(devPtr); }
 /** Synchronize the context. */
 export function cuSync(): number { return cu().cuCtxSynchronize(); }
+
+// ── Async copy path (side stream) ─────────────────────────────────────
+// Async HtoD/DtoH on a dedicated stream overlaps copies with default-stream
+// kernel execution, instead of the default-stream synchronous variants which
+// act as a full pipeline drain on every call.
+let _copyStream: bigint | null = null;
+let _copyStreamCreated = false;
+function copyStream(): bigint {
+  const cs = cu();
+  if (!_copyStreamCreated) {
+    const b = Buffer.alloc(8);
+    if (cs.cuStreamCreate(b, 1 /* non-blocking */) !== 0)
+      throw new Error("cuStreamCreate failed");
+    _copyStream = b.readBigUInt64LE(0);
+    _copyStreamCreated = true;
+  }
+  return _copyStream!;
+}
+/** Copy host → device, asynchronous on the side copy stream. */
+export function cuHtoDAsync(devPtr: bigint, hostBuf: Buffer | ArrayBuffer, bytes?: number | bigint): void {
+  const buf = hostBuf instanceof ArrayBuffer ? Buffer.from(hostBuf) : hostBuf;
+  const rc = cu().cuMemcpyHtoDAsync_v2(devPtr, buf, BigInt(bytes ?? buf.byteLength), copyStream());
+  if (rc !== 0) throw new Error(`cuMemcpyHtoDAsync failed (rc=${rc})`);
+}
+/** Copy device → host, asynchronous on the side copy stream. */
+export function cuDtoHAsync(hostBuf: Buffer | ArrayBuffer, devPtr: bigint, bytes?: number | bigint): void {
+  const buf = hostBuf instanceof ArrayBuffer ? Buffer.from(hostBuf) : hostBuf;
+  const rc = cu().cuMemcpyDtoHAsync_v2(buf, devPtr, BigInt(bytes ?? buf.byteLength), copyStream());
+  if (rc !== 0) throw new Error(`cuMemcpyDtoHAsync failed (rc=${rc})`);
+}
+/** Block until the copy stream is done (without draining the default stream). */
+export function cuCopySync(): number { return cu().cuStreamSynchronize(copyStream()); }
+
 
 /** Launch a loaded kernel. `args` is an array of BigInt device pointers and numbers. */
 export function cuLaunch(k: LoadedKernel, grid: [number,number,number], block: [number,number,number], args: (bigint | number)[]): number {
