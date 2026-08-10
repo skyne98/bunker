@@ -115,7 +115,7 @@ b.store(tpC, b.divf(expX, denomBc));
 | **Elementwise** | `add/sub/mul/div`, `divi/divf/remi`, `minimum/maximum`, `shl/lshr/ashr/and/or/xor`, `neg`, `abs` (type-aware int/float) |
 | **Casts** | `trunc/ext/zext/sitofp/fptosi/fpext/fptrunc/bitcast/indexCast` |
 | **Compare** | `eq/ne/lt/gt/le/ge` (type-aware → i1), `select` |
-| **Math** | `exp` (inlines). `sqrt/rsqrt/log/sin/cos/tanh/floor/ceil/round` need libdevice (see Limitations) |
+| **Math** | `exp` (inlines), `sqrt/rsqrt/log/sin/cos/tanh/floor/ceil/round` via linked **libdevice** (`__nv_*` device functions) |
 | **Reductions** | `sum/max/min` (via `tt.reduce`, region form) |
 | **Matmul** | `dot` (single-tile, chained, `scf.for` K-loop with iter-arg accumulator → `mma.sync` tensor cores) |
 | **Memory** | `makeTensorPtr` + `advance` (tiled pointers), `splatPtr` + `addptr` (pointer-tensors), `load`/`store` (both forms, boundaryCheck/mask/other) |
@@ -137,9 +137,6 @@ cuLaunch(kernel, [gx,gy,gz], [bx,by,bz], args[])   cuSync()    cuFree(devPtr)
 
 ## Limitations (honest)
 
-- **`math.sqrt`/`rsqrt`/`log`/`sin`/`cos`/`tanh`** lower to libdevice calls
-  (`__nv_*`) the shim doesn't link. Only `math.exp` inlines. **Fix:** link
-  `libdevice.10.bc` (or lower `math.*` to native PTX) — a shim rebuild.
 - **AMDGCN backend** is structurally ready in `triton_shim.c`
   (`triton_compile_targeted`, `amdgcn-amd-amdhsa` triple) but gated on linking
   Triton's AMD backend (`triton/third_party/amd`) at build time.
