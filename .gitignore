@@ -1,3 +1,5 @@
 node_modules/
 shim/*.so
 shim/*.dbg
+third_party/
+result

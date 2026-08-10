@@ -874,7 +874,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
     const normed=palloc(H*2);
     launch(kRms,[1,1,1],[128,1,1],[x,wp(W,layer,"input_layernorm.weight"),normed],`rms1.${layer}.${step}`);
     
-    let attnF32=palloc(H*4);
+    let afterAttn:bigint;
     
     if (!full) {
       // GDN decode — fused GEMMs (Cast epilogue, dual A+B, Cast+Add for out_proj)
@@ -895,7 +895,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       const tmpSs = sStates[layer]; sStates[layer] = sStatesNew[layer]; sStatesNew[layer] = tmpSs;
       pfree(convOut); pfree(zB); pfree(aP); pfree(bP);
       // Fused out_proj+Cast+Add: output = bf16(gdnOut @ W + x)
-      const afterAttn=palloc(H*2); // bf16 output with residual
+      afterAttn=palloc(H*2); // bf16 output with residual
       launch(kOutProj,[1,Math.ceil(H/64),1],[128,1,1],[gdnOut,wp(W,layer,"linear_attn.out_proj.weight"),afterAttn,x],`op.${layer}`);
       pfree(gdnOut); pfree(x);
     } else {
@@ -921,7 +921,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       launch(kFA2A,[NH,1,1],[128,1,1],[qBuf,kNormB,vB,qgB,kvCacheK[layer],kvCacheV[layer],maskBuf,fa2Out,step],`fa2.${layer}`);
       pfree(qgB); pfree(vB); pfree(kB); pfree(kNormB);
       // Fused o_proj+Cast+Add: output = bf16(fa2Out @ W + x)
-      const afterAttn=palloc(H*2); // bf16 output with residual
+      afterAttn=palloc(H*2); // bf16 output with residual
       launch(kOProj,[1,Math.ceil(H/64),1],[128,1,1],[fa2Out,wp(W,layer,"self_attn.o_proj.weight"),afterAttn,x],`op.${layer}`);
       pfree(fa2Out); pfree(x);
     }

@@ -104,14 +104,6 @@ const char* triton_compile_targeted(const char* ttir_mlir, int num_warps,
   if (features == nullptr) features = isCuda ? "+ptx75" : "";
 
   mlir::registerAllPasses();
-  mlir::triton::registerTritonPasses();
-  mlir::triton::gpu::registerTritonGPUPasses();
-  mlir::triton::nvidia_gpu::registerTritonNvidiaGPUPasses();
-  mlir::triton::instrument::registerTritonInstrumentPasses();
-  mlir::triton::registerTritonToTritonGPUPasses();
-  mlir::triton::registerTritonNVIDIAGPUToLLVMPasses();
-  mlir::triton::registerConvertNVGPUToLLVMPass();
-  mlir::triton::registerNVWSTransformsPasses();
 
   mlir::DialectRegistry registry;
   registry.insert<mlir::triton::TritonDialect,
@@ -219,6 +211,11 @@ const char* triton_compile_targeted(const char* ttir_mlir, int num_warps,
       const char* p = features ? std::strstr(features, "+ptx") : nullptr;
       if (p) ptx = std::atoi(p + 4);
       pm.addPass(mlir::triton::createConvertTritonGPUToLLVMPass(cc, ptx));
+      // NVIDIA warp-id / TMEM ops are intentionally left for the NVGPUToLLVM
+      // pass (see TritonGPUToLLVM.cpp: "We handle the warp ID op during
+      // NVGPUToLLVM"). Without it ttg.warp_id survives and the final
+      // translateModuleToLLVMIR fails with "missing LLVMTranslationDialectInterface".
+      pm.addPass(mlir::triton::createConvertNVGPUToLLVM());
     } else {
       // AMD path: the AMD GPU → LLVM conversion pass (requires AMD backend).
       // When TRITON_AMD_BACKEND is enabled, the AMD pass is registered and

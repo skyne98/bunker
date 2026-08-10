@@ -1,6 +1,5 @@
 // prototypes/compare.ts — Differential testing: compare our TTIR pipeline against PyTorch reference.
-//   source /tmp/refenv/bin/activate && python3 prototypes/ref_dump.py --prompt "Hello" --output /tmp/ref_tensors.safetensors
-//   TOKENIZER_PATH=/tmp/tokenizer.json SAFETENSORS_PATH=/tmp/qwen35_0.8b.safetensors bun run prototypes/compare.ts
+//   SAFETENSORS_PATH=/tmp/qwen35_0.8b.safetensors bun run prototypes/compare.ts
 import { TTIRBuilder, compileAndLoad, cuAlloc, cuHtoD, cuDtoH, cuFree, cuSync, cuLaunch } from "../src/ttir";
 import { dlopen, ptr as ffiPtr } from "bun:ffi";
 
