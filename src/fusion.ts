@@ -16,6 +16,7 @@
 //   * portability: no sm_86/PTX literals here; kernels compile via the shim
 
 import { TTIRBuilder, compileAndLoad, cuLaunch, cuSync, LoadedKernel } from "./ttir";
+import { emitEmbed, emitConv1d, emitGDN, emitQNorm, emitKNorm, emitRoPE, emitRoPEK, emitFA2Attn, emitArgmax } from "./emitters";
 
 // ═══════════════════════════════════════════════════════════════════
 // Types
@@ -154,7 +155,10 @@ export function gridsCompatible(g1: [number, number, number], g2: [number, numbe
 }
 
 /** Ops that cannot consume an SSA value (need a global-memory pointer). */
-export const POINTER_INPUT_OPS = new Set(["gemm", "gdn_delta_rule", "conv1d_decode", "fa2_prep", "fa2_attn", "argmax", "embed"]);
+export const POINTER_INPUT_OPS = new Set(["gemm", "gdn_delta_rule", "conv1d_decode", "fa2_prep", "fa2_attn", "argmax", "embed", "qnorm", "knorm", "rope", "ropek"]);
+
+/** Ops whose emitters write outputs directly (state/scalar/pointer outputs). */
+export const OP_STATEFUL = new Set(["embed", "conv1d_decode", "gdn_delta_rule", "qnorm", "knorm", "rope", "ropek", "fa2_attn", "argmax"]);
 
 /**
  * Check whether a candidate group is internally valid:
@@ -288,6 +292,15 @@ export function emitNode(ctx: EmitCtx, node: GraphNode): any {
     case "add": return emitAdd(ctx, node);
     case "rmsnorm": return emitRmsNorm(ctx, node);
     case "swiglu": return emitSwiGLU(ctx, node);
+    case "embed": return emitEmbed(ctx, node);
+    case "conv1d_decode": return emitConv1d(ctx, node);
+    case "gdn_delta_rule": return emitGDN(ctx, node);
+    case "qnorm": return emitQNorm(ctx, node);
+    case "knorm": return emitKNorm(ctx, node);
+    case "rope": return emitRoPE(ctx, node);
+    case "ropek": return emitRoPEK(ctx, node);
+    case "fa2_attn": return emitFA2Attn(ctx, node);
+    case "argmax": return emitArgmax(ctx, node);
     default: throw new Error(`fusion: no emitter for op '${node.op}' — refusing to zero-fill`);
   }
 }
@@ -318,16 +331,24 @@ export function codegenGroup(graph: Graph, group: GraphNode[], groupIndex: numbe
   for (const n of group)
     for (const o of n.outputs) {
       const t = graph.tensors.get(o.tensorName)!;
-      if (!fusedAway.has(o.tensorName) && t.role !== "state") external.add(o.tensorName);
+      // Include state outputs as params too: their emitters store to them.
+      if (!fusedAway.has(o.tensorName)) external.add(o.tensorName);
     }
 
   const args: string[] = [];
   const ptrs = new Map<string, any>();
   for (const name of external) {
     const t = graph.tensors.get(name)!;
-    const p = b.param(`arg${args.length}`, { ptr: t.type.dtype as any });
-    args.push(name);
-    ptrs.set(name, p);
+    if (t.role === "scalar") {
+      // scalar kernel parameter (e.g. token_id / Pos)
+      const p = b.param(`arg${args.length}`, t.type.dtype as any);
+      args.push(name);
+      ptrs.set(name, p);
+    } else {
+      const p = b.param(`arg${args.length}`, { ptr: t.type.dtype as any });
+      args.push(name);
+      ptrs.set(name, p);
+    }
   }
 
   // tile
@@ -352,13 +373,12 @@ export function codegenGroup(graph: Graph, group: GraphNode[], groupIndex: numbe
 
   // emit each node in group order (topological within group)
   for (const n of group) {
-    // For GEMM: the group supplies a single grid; gemm reads A (external) + B (external),
-    // writes an SSA f32/bf16 accumulator. It must be the FIRST node for now.
     const out = emitNode(ctx, n);
-    // route outputs
+    // Route outputs. Ops whose emitters store directly (stateful ops) already
+    // wrote their outputs to global memory — skip re-materialization for them.
     for (const o of n.outputs) {
       const t = graph.tensors.get(o.tensorName)!;
-      if (t.role === "state") continue;
+      if (OP_STATEFUL.has(n.op)) continue; // emitter already stored it
       if (fusedAway.has(o.tensorName)) {
         ctx.vals.set(o.tensorName, out);
       } else {
