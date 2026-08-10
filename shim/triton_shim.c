@@ -8,6 +8,8 @@
 // Shared memory size from the last compilation
 static int64_t g_last_shmem_size = 0;
 
+#include <unordered_set>
+
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -43,6 +45,9 @@ static int64_t g_last_shmem_size = 0;
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Linker/Linker.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
@@ -88,6 +93,46 @@ static void initAllTargets() {
 #ifndef TRITON_AMD_BACKEND
 #define TRITON_AMD_BACKEND 0
 #endif
+
+// Path to NVIDIA's libdevice.10.bc (device math: __nv_sqrtf, __nv_logf, ...).
+// Defaults to the Triton-vendored copy (ABI-matched to this build's LLVM).
+// Override with TRITON_LIBDEVICE env var at runtime.
+#ifndef TRITON_LIBDEVICE_PATH
+#define TRITON_LIBDEVICE_PATH \
+  "/nix/store/5lxy0mn9vj7s6xr97jvdgk2b2vxm743j-python3.14-triton-3.7.0/lib/python3.14/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+#endif
+
+// Link NVIDIA's libdevice bitcode into the LLVM module so calls to __nv_*
+// (sqrt/log/sin/cos/tanh/...) resolve before PTX emission. Mirrors Triton's
+// llvm.link_extern_libs exactly (LinkOnlyNeeded + mark internal).
+static bool link_libdevice(llvm::Module* mod, std::string& err) {
+  const char* path = getenv("TRITON_LIBDEVICE");
+  if (!path || !*path) path = TRITON_LIBDEVICE_PATH;
+  if (!path || !*path) return true;  // no libdevice configured — leave as-is
+
+  llvm::SMDiagnostic diag;
+  auto lib = llvm::parseIRFile(path, diag, mod->getContext());
+  if (!lib) {
+    err = "Failed to parse libdevice at " + std::string(path);
+    return false;
+  }
+  lib->setTargetTriple(mod->getTargetTriple());
+  lib->setDataLayout(mod->getDataLayout());
+
+  std::unordered_set<std::string> externalFns;
+  for (llvm::Function& fn : lib->functions())
+    if (!fn.isDeclaration()) externalFns.insert(fn.getName().str());
+
+  llvm::Linker linker(*mod);
+  if (linker.linkInModule(std::move(lib), llvm::Linker::Flags::LinkOnlyNeeded)) {
+    err = "Failed to link libdevice at " + std::string(path);
+    return false;
+  }
+  for (llvm::Function& fn : mod->functions())
+    if (externalFns.count(fn.getName().str()))
+      fn.setLinkage(llvm::GlobalValue::InternalLinkage);
+  return true;
+}
 
 const char* triton_compile_targeted(const char* ttir_mlir, int num_warps,
                                      const char* backend, const char* arch,
@@ -259,6 +304,14 @@ const char* triton_compile_targeted(const char* ttir_mlir, int num_warps,
   auto llvmModule = mlir::translateModuleToLLVMIR(module.get(), llvmCtx);
   if (!llvmModule) {
     return strdup("ERROR: Failed to translate to LLVM IR");
+  }
+
+  // Link libdevice so __nv_* calls (sqrt/log/sin/...) resolve before PTX.
+  if (isCuda) {
+    std::string linkErr;
+    if (!link_libdevice(llvmModule.get(), linkErr)) {
+      return strdup(("ERROR: " + linkErr).c_str());
+    }
   }
 
   // LLVM IR → ISA (PTX for cuda, AMDGCN for rocm).
