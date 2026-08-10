@@ -153,8 +153,11 @@ shim/build_shim.sh   # → shim/libtriton_shim.so (TTIR → PTX via Triton MLIR)
 The build is fully de-"`/tmp`-ized": Triton source and all objects live in the
 persistent, git-ignored `third_party/` dir (`third_party/triton-src` at commit
 `76e268973`, pinned to LLVM `ac5dc54d5`), so GCs/reboots no longer break it.
-Triton sources compile in parallel (`xargs -P`), then link against the Nix
-triton-llvm archives. Verifies with `bun run tests/test_ttir_matmul_run.ts`.
+A hermetic `third_party/triton-src-76e268973.tar.zst` snapshot (pure source,
+no `.git`) is re-extracted automatically whenever the source dir is missing
+or incomplete — no network, no promisor-metadata dependence. Triton sources
+compile in parallel (`xargs -P`), then link against the Nix triton-llvm
+archives. Verifies with `bun run tests/test_ttir_matmul_run.ts`.
 
 ## Project layout
 

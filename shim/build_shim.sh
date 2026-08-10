@@ -47,23 +47,37 @@ mkdir -p "$BUILD_ROOT"
 # ─── Verify Triton source is at the correct commit ───────────────────
 TRITON_COMMIT="76e268973"
 EXPECTED_LLVM_HASH="ac5dc54d509169d387fcfd495d71853d81c46484"
+# Hermetic source snapshot (git-ignored, survives GC/reboots). See Phase 2 of
+# the fix plan: a pure-source tarball (no .git) so the build is reproducible
+# and immune to promisor-metadata / partial-clone loss.
+TRITON_TARBALL="${TRITON_TARBALL:-$BUILD_ROOT/triton-src-$TRITON_COMMIT.tar.zst}"
 
-if [ ! -d "$TRITON_SRC" ]; then
-  echo "Cloning Triton at commit $TRITON_COMMIT (persistent)..."
-  git clone --filter=blob:none https://github.com/triton-lang/triton "$TRITON_SRC"
-  cd "$TRITON_SRC"
-  git checkout "$TRITON_COMMIT"
-else
-  cd "$TRITON_SRC"
-  CURRENT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-  if [ "$CURRENT_COMMIT" != "$TRITON_COMMIT" ]; then
-    echo "WARNING: Triton source is at $CURRENT_COMMIT, expected $TRITON_COMMIT"
-    echo "  Run: cd $TRITON_SRC && git checkout $TRITON_COMMIT"
-    exit 1
+# Source is "complete" only if it has real content (the old failure mode was
+# an empty dir passing the `-d` check and stalling the build).
+source_incomplete() {
+  [ ! -d "$TRITON_SRC" ] && return 0
+  [ ! -f "$TRITON_SRC/cmake/llvm-hash.txt" ] && return 0
+  ! find "$TRITON_SRC/lib" -name '*.cpp' 2>/dev/null | grep -q . && return 0
+  return 1
+}
+
+if source_incomplete; then
+  if [ -f "$TRITON_TARBALL" ]; then
+    echo "Materializing Triton $TRITON_COMMIT from $TRITON_TARBALL..."
+    rm -rf "$TRITON_SRC"
+    mkdir -p "$TRITON_SRC"
+    tar --zstd -xf "$TRITON_TARBALL" -C "$TRITON_SRC"
+  else
+    echo "Cloning Triton at commit $TRITON_COMMIT (persistent)..."
+    git clone --filter=blob:none https://github.com/triton-lang/triton "$TRITON_SRC"
+    cd "$TRITON_SRC"
+    git checkout "$TRITON_COMMIT"
   fi
 fi
+cd "$TRITON_SRC"
 
-# Verify the LLVM hash matches
+# Verify the LLVM hash matches (committed sources have no .git, so skip the
+# git-rev check; hash + source completeness is the ground truth).
 ACTUAL_LLVM_HASH=$(cat "$TRITON_SRC/cmake/llvm-hash.txt" 2>/dev/null || \
   jq -r '.llvm_hash' "$TRITON_SRC/cmake/llvm-info.json" 2>/dev/null || echo "")
 if [ "$ACTUAL_LLVM_HASH" != "$EXPECTED_LLVM_HASH" ]; then
