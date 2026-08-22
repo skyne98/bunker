@@ -21,6 +21,17 @@ bun run tests/test_ttir_softmax.ts         # softmax: reduce + math.exp + elemen
 bun run tests/test_ttir_matmul_kloop.ts    # FP16 matmul with a K-loop (scf.for + tt.advance)
 ```
 
+## Automatic fusion & tile discovery (`bench/autotune_decode.ts`)
+
+Fusion choices are discovered by **measured search**, never hand-picked
+(AGENTS.md). `src/fusion.ts`'s `explore()` beam-searches the merge/split space
+AND a per-GEMM **tile** axis (`BN × BK`, bit-exact configs that divide the
+GEMM); `src/policy.ts` persists the best (partition, tiles) to JSON with a
+graph-signature guard. `codegenGroup` auto-derives the launch grid from the
+searched tile. Verify: `bun run tests/test_fusion_search.ts` (pure) and
+`bun run bench/autotune_decode.ts` (GPU; it discovers BN=16/BK=256 for the
+layer-0 qkv GEMM automatically).
+
 ## Two ways to write kernels
 
 ### 1. Arrow-function lift (pleasant — like Triton Python)

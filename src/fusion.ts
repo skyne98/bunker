@@ -61,6 +61,48 @@ export interface Tensor {
 
 export type Partition = GraphNode[][];
 
+// ════════════════════════════════════════════════════════════════
+// Kernel tile search (a move dimension of `explore`)
+// ════════════════════════════════════════════════════════════════
+// A GEMM kernel may run with different (BN, BK) tiles. Changing the tile keeps
+// the per-element K accumulation chain identical (the ascending mma.sync k16
+// sequence is unchanged), so every tile here is BIT-EXACT — it only trades
+// block count (occupancy) against per-block work. The search discovers the
+// fastest tile per GEMM instead of hardcoding one.
+export interface TileConfig { BN: number; BK: number; }
+/** Per-GEMM tile assignments inside a candidate; unassigned nodes use the default. */
+export type TileAssign = Partial<Record<number, TileConfig>>;
+/** Tile used when a GEMM has no explicit assignment. */
+export const DEFAULT_GEMM_TILE: TileConfig = { BN: 64, BK: 64 };
+/** Curated, measured-by-search tile space. Both dims must divide the GEMM evenly. */
+export const GEMM_TILE_SEARCH: TileConfig[] = [
+  { BN: 16, BK: 64 },
+  { BN: 16, BK: 128 },
+  { BN: 16, BK: 256 },
+  { BN: 32, BK: 64 },
+  { BN: 32, BK: 128 },
+  { BN: 32, BK: 256 },
+  { BN: 64, BK: 64 },
+  { BN: 64, BK: 256 },
+];
+/** True when a tile divides a GEMM evenly (required for bit-exact tiling). */
+export function tileDivides(tile: TileConfig, N: number, K: number): boolean {
+  return N % tile.BN === 0 && K % tile.BK === 0;
+}
+/**
+ * Resolve the effective tile for a GEMM: use the searched tile when it divides
+ * the GEMM evenly, else fall back to the legacy 64-wide default. Shared by
+ * codegenGroup (grid derivation) and emitGemm (tile shapes) so they cannot
+ * diverge.
+ */
+export function resolveGemmTile(tile: TileConfig | undefined, N: number, K: number): TileConfig {
+  const t = tile ?? DEFAULT_GEMM_TILE;
+  return {
+    BN: (N % t.BN === 0) ? t.BN : Math.min(64, N),
+    BK: (K % t.BK === 0) ? t.BK : Math.min(64, K),
+  };
+}
+
 export interface KernelPlan {
   ttir: string;
   name: string;
@@ -210,6 +252,8 @@ type EmitCtx = {
   ptrs: Map<string, any>;
   tile: number[];
   pidAxis: 0 | 1 | 2;
+  /** per-GEMM tile assignments (searched); hit only for single-GEMM groups */
+  tiles: TileAssign;
 };
 
 /** Load an input: SSA if fused-away, else from global memory via ptr. */
@@ -226,11 +270,12 @@ function loadInput(ctx: EmitCtx, inp: NodeIO): any {
 }
 
 function emitGemm(ctx: EmitCtx, node: GraphNode): any {
-  const { b } = ctx;
+  const { b, tiles } = ctx;
   const { M, N, K, N2 } = node.params;
   const A = ctx.ptrs.get(node.inputs[0].tensorName)!;
   const B = ctx.ptrs.get(node.inputs[1].tensorName)!;
-  const BM = Math.min(64, M), BN = Math.min(64, N), BK = Math.min(64, K);
+  const t = resolveGemmTile(tiles[node.id], N, K);
+  const BM = Math.min(64, M), BN = t.BN, BK = t.BK;
   const pM = b.programId(0), pN = b.programId(1);
   const tpA = b.makeTensorPtr(A, [M, K], [K, 1], [b.mul(pM, b.i32(BM)), b.i32(0)], [BM, BK], "bf16", [1, 0]);
   const tpB = b.makeTensorPtr(B, [K, N], [1, K], [b.i32(0), b.mul(pN, b.i32(BN))], [BK, BN], "bf16", [0, 1]);
@@ -309,7 +354,7 @@ export function emitNode(ctx: EmitCtx, node: GraphNode): any {
 // Codegen — turn one group into one TTIR kernel
 // ═══════════════════════════════════════════════════════════════════
 
-export function codegenGroup(graph: Graph, group: GraphNode[], groupIndex: number): KernelPlan {
+export function codegenGroup(graph: Graph, group: GraphNode[], groupIndex: number, tiles?: TileAssign): KernelPlan {
   const b = new TTIRBuilder();
   const inGroup = new Set(group.map(n => n.id));
   const fusedAway = new Set<string>();
@@ -351,25 +396,33 @@ export function codegenGroup(graph: Graph, group: GraphNode[], groupIndex: numbe
     }
   }
 
-  // tile
+  // tile (elementwise materialization width) + launch grid.
   let tile: number[] = [1, 1024];
-  let tileFrom = false;
-  for (const n of group) {
-    if (n.op === "gemm") {
-      tile = [1, Math.min(64, n.params.N)];
-      tileFrom = true;
-      break;
+  let grid: [number, number, number] = group[0].grid;
+  if (group.length === 1 && group[0].op === "gemm") {
+    // Single-GEMM kernel: the grid follows the searched tile (grid.y =
+    // ceil(N/BN)), NOT the model's declared N/64 grid — otherwise a BN != 64
+    // kernel would compute only a fraction of the columns. Keeps the grid and
+    // the emitted tile in lockstep.
+    const g = group[0];
+    const t = resolveGemmTile(tiles?.[g.id], g.params.N, g.params.K);
+    tile = [1, t.BN];
+    grid = [1, Math.ceil(g.params.N / t.BN), 1];
+  } else {
+    // Fused groups keep the declared grid + the legacy 64-wide materialization
+    // tile (elementwise output width); a lone rmsnorm materializes its full row.
+    for (const n of group) {
+      if (n.op === "gemm") { tile = [1, Math.min(64, n.params.N)]; break; }
     }
+    if (group.length === 1 && group[0].op === "rmsnorm") tile = [1, group[0].params.N];
   }
-  if (!tileFrom && group.length === 1 && group[0].op === "rmsnorm") tile = [1, group[0].params.N];
 
   // grid axis: if any node has grid.y > 1, pids index rows along y (2D grid);
   // else grid.x is the single row axis (1D grid).
   const hasY = group.some(n => n.grid[1] > 1);
-  // For gemm groups the grid is [1, N/64, 1]: pN=programId(1), pM=0.
   const pidAxis: 0 | 1 = hasY ? 1 : 0;
 
-  const ctx: EmitCtx = { b, graph, vals: new Map(), ptrs, tile, pidAxis: pidAxis as 0 | 1 | 2 };
+  const ctx: EmitCtx = { b, graph, vals: new Map(), ptrs, tile, pidAxis: pidAxis as 0 | 1 | 2, tiles: tiles ?? {} };
 
   // emit each node in group order (topological within group)
   for (const n of group) {
@@ -396,7 +449,7 @@ export function codegenGroup(graph: Graph, group: GraphNode[], groupIndex: numbe
 
   const name = `f${groupIndex}`;
   const ttir = b.build(name, 4, args.length);
-  return { ttir, name, args, grid: group[0].grid, group };
+  return { ttir, name, args, grid, group };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -418,15 +471,16 @@ export interface RunEnv {
 /**
  * Compile a partition into kernels. Throws if any group is invalid or any op
  * is un-emittable — the engine never silently drops work.
+ * `tiles` binds searched tile configs to specific GEMM node ids.
  */
-export function compilePartition(graph: Graph, partition: Partition): KernelPlan[] {
+export function compilePartition(graph: Graph, partition: Partition, tiles?: TileAssign): KernelPlan[] {
   const plans: KernelPlan[] = [];
   for (let gi = 0; gi < partition.length; gi++) {
     const group = partition[gi];
     if (!validGroup(group, graph))
       throw new Error(`fusion: invalid group ${gi} (${group.map(n => n.op).join("+")})`);
     try {
-      plans.push(codegenGroup(graph, group, gi));
+      plans.push(codegenGroup(graph, group, gi, tiles));
     } catch (e: any) {
       throw new Error(`fusion: codegen failed for group ${gi} (${group.map(n => n.op).join("+")}): ${e.message}`);
     }
@@ -472,18 +526,48 @@ export interface ExploreConfig {
   beam?: number;
   /** max partitions evaluated (default 40) */
   budget?: number;
-  /** allowed moves (default: split + merge) */
-  moves?: ("split" | "merge")[];
+  /** allowed moves (default: split + merge + tile) */
+  moves?: ("split" | "merge" | "tile")[];
   verbose?: boolean;
   /** if a candidate fails to compile, dump its TTIR for debugging */
   dumpOnError?: boolean;
 }
 
-/** A candidate = a partition + its measured latency (maybe null if bad). */
+/** A candidate = a partition + per-GEMM tiles + its measured latency. */
 export interface Candidate {
   partition: Partition;
+  /** searched tile per GEMM node id (unassigned = stacked default) */
+  tiles: TileAssign;
   latencyMs: number | null;
 }
+
+/**
+ * All legal single-tile moves: one GEMM at a time, one config at a time.
+ * Only configs that divide the GEMM evenly are legal (bit-exact tiling). Each
+ * move changes exactly one node's (BN, BK) and leaves the partition intact.
+ */
+export function tileMoves(partition: Partition, tiles: TileAssign): { partition: Partition; tiles: TileAssign }[] {
+  const out: { partition: Partition; tiles: TileAssign }[] = [];
+  for (let gi = 0; gi < partition.length; gi++) {
+    const gemm = partition[gi].find(n => n.op === "gemm");
+    if (!gemm) continue;
+    const cur = tiles[gemm.id] ?? DEFAULT_GEMM_TILE;
+    const N = gemm.params.N as number, K = gemm.params.K as number;
+    for (const t of GEMM_TILE_SEARCH) {
+      if (t.BN === cur.BN && t.BK === cur.BK) continue;
+      if (!tileDivides(t, N, K)) continue;
+      out.push({ partition: partition.map(g => [...g]), tiles: { ...tiles, [gemm.id]: t } });
+    }
+  }
+  return out;
+}
+
+/** Key for dedupe/beam bookkeeping: partition + tiles are both identity. */
+export function candKey(c: { partition: Partition; tiles: TileAssign }): string {
+  return c.partition.map(g => g.map(n => n.id).join(",")).join("|") + "#tiles:" +
+    Object.keys(c.tiles).sort().map(id => `${id}=${c.tiles[Number(id)]!.BN}x${c.tiles[Number(id)]!.BK}`).join(",");
+}
+
 
 function initialPartition(graph: Graph): Partition {
   // start with every node its own kernel (safest, correct baseline)
@@ -493,11 +577,38 @@ function initialPartition(graph: Graph): Partition {
 /** All legal single-merge moves: merge group i with i+1 (when valid). */
 function mergeMoves(graph: Graph, partition: Partition): Partition[] {
   const out: Partition[] = [];
-  for (let i = 0; i < partition.length - 1; i++) {
-    const merged = partition.map(g => [...g]);
-    merged[i] = [...partition[i], ...partition[i + 1]];
-    merged.splice(i + 1, 1);
-    if (validGroup(merged[i], graph)) out.push(merged);
+  // Dataflow adjacency: two groups may be merged if a tensor flows between them
+  // (producer group → consumer group) OR they are positionally adjacent. This
+  // gives the search access to ALL legal producer→consumer groupings, not just
+  // the few that happen to be next to each other in the partition list.
+  const byId = new Map<number, GraphNode[] | undefined>();
+  for (let i = 0; i < partition.length; i++) for (const n of partition[i]) byId.set(n.id, partition[i]);
+  const flows = new Map<number, Set<number>>(); // group index -> set of reachable group indexes
+  for (let i = 0; i < partition.length; i++) {
+    const reach = new Set<number>();
+    for (const n of partition[i])
+      for (const inp of n.inputs) {
+        const t = graph.tensors.get(inp.tensorName);
+        if (t && t.producer) {
+          const pg = byId.get(t.producer.id);
+          if (pg) reach.add(partition.indexOf(pg));
+        }
+      }
+    flows.set(i, reach);
+  }
+  const considered = new Set<string>();
+  for (let i = 0; i < partition.length; i++) {
+    for (let j = i + 1; j < partition.length; j++) {
+      const dataflow = flows.get(i)!.has(j) || flows.get(j)!.has(i);
+      if (!dataflow && j !== i + 1) continue; // must be adjacent OR dataflow-connected
+      const key = i + "," + j;
+      if (considered.has(key)) continue;
+      considered.add(key);
+      const merged = partition.map(g => [...g]);
+      merged[i] = [...partition[i], ...partition[j]];
+      merged.splice(j, 1);
+      if (validGroup(merged[i], graph)) out.push(merged);
+    }
   }
   return out;
 }
@@ -545,38 +656,36 @@ export function explore(
 ): { best: Candidate; candidates: Candidate[] } {
   const beam = cfg.beam ?? 4;
   const budget = cfg.budget ?? 40;
-  const moves = cfg.moves ?? ["split", "merge"];
+  const moves = cfg.moves ?? ["split", "merge", "tile"];
   const verbose = cfg.verbose ?? false;
 
-  const partKey = (p: Partition) => p.map(g => g.map(n => n.id).join(",")).join("|");
-
-  let beamCands: Candidate[] = [{ partition: initialPartition(graph), latencyMs: null }];
+  const initial: Candidate = { partition: initialPartition(graph), tiles: {}, latencyMs: null };
+  let beamCands: Candidate[] = [initial];
   const all: Candidate[] = [];
   const seen = new Set<string>();
 
-  const evaluate = (p: Partition): Candidate => {
-    const key = partKey(p);
-    if (seen.has(key)) return { partition: p, latencyMs: null };
+  const evaluate = (c: Candidate): Candidate => {
+    const key = candKey(c);
+    if (seen.has(key)) return { ...c, latencyMs: null };
     seen.add(key);
     let latencyMs: number | null = null;
     try {
-      const plans = compilePartition(graph, p);
+      const plans = compilePartition(graph, c.partition, c.tiles);
       latencyMs = measurePartition(plans, env, 5);
-      if (verbose) console.log(`  ✓ ${p.length} kernels: ${latencyMs.toFixed(3)}ms`);
+      if (verbose) console.log(`  ✓ ${c.partition.length} kernels: ${latencyMs.toFixed(3)}ms`);
     } catch (e: any) {
       if (cfg.dumpOnError) {
         console.log("=== ERROR candidate TTIR ===");
-        try { for (const g of p) codegenGroup(graph, g, 0); } catch (e2: any) { console.log(e2.message); }
-        for (const g of p) {
-          try { const pl = codegenGroup(graph, g, 0); console.log(`-- group ${g.map(n => n.op).join("+")} --\n${pl.ttir}`); }
+        for (const g of c.partition) {
+          try { const pl = codegenGroup(graph, g, 0, c.tiles); console.log(`-- group ${g.map(n => n.op).join("+")} --\n${pl.ttir}`); }
           catch (e2: any) { console.log(`-- group ${g.map(n => n.op).join("+")} FAILED: ${e2.message}`); }
         }
       }
-      if (verbose) console.log(`  ✗ ${p.length} kernels: ${e.message.split("\n")[0]}`);
+      if (verbose) console.log(`  ✗ ${c.partition.length} kernels: ${e.message.split("\n")[0]}`);
     }
-    const c: Candidate = { partition: p, latencyMs };
-    all.push(c);
-    return c;
+    const out: Candidate = { ...c, latencyMs };
+    all.push(out);
+    return out;
   };
 
   let used = 0;
@@ -584,14 +693,16 @@ export function explore(
     const children = new Map<string, Candidate>();
     for (const cand of beamCands) {
       for (const mv of moves) {
-        let moveSet: Partition[] = [];
-        if (mv === "split") moveSet = splitMoves(graph, cand.partition);
-        else if (mv === "merge") moveSet = mergeMoves(graph, cand.partition);
-        for (const p of moveSet) {
+        let moveSet: Candidate[] = [];
+        if (mv === "split") moveSet = splitMoves(graph, cand.partition).map(p => ({ partition: p, tiles: cand.tiles, latencyMs: null }));
+        else if (mv === "merge") moveSet = mergeMoves(graph, cand.partition).map(p => ({ partition: p, tiles: cand.tiles, latencyMs: null }));
+        else if (mv === "tile")
+          moveSet = tileMoves(cand.partition, cand.tiles).map(t => ({ partition: t.partition, tiles: t.tiles, latencyMs: null }));
+        for (const c of moveSet) {
           if (used >= budget) break;
-          const c = evaluate(p);
+          const ev = evaluate(c);
           used++;
-          if (c.latencyMs !== null) children.set(partKey(p), c);
+          if (ev.latencyMs !== null) children.set(candKey(ev), ev);
         }
       }
     }
@@ -600,9 +711,9 @@ export function explore(
     if (!next.length) break; // no new valid candidates
     beamCands = next;
     if (verbose) console.log(`  beam → best ${beamCands[0].latencyMs?.toFixed(3)}ms (${beamCands[0].partition.length} kernels)`);
-    // avoid infinite loop if we can't progress
-    if (next.length === 1 && seen.has(partKey(next[0].partition))) {
-      const inc = ranked.filter(r => !seen.has(partKey(r.partition)));
+    // avoid an infinite loop when the beam cannot expand
+    if (next.length === 1 && seen.has(candKey(next[0]))) {
+      const inc = ranked.filter(r => !seen.has(candKey(r)));
       if (!inc.length) break;
       beamCands = inc.slice(0, 1);
     }
@@ -611,7 +722,7 @@ export function explore(
   const evaluated = all.filter(c => c.latencyMs !== null);
   const best = evaluated.length
     ? evaluated.sort((a, b) => (a.latencyMs ?? 1e9) - (b.latencyMs ?? 1e9))[0]
-    : { partition: initialPartition(graph), latencyMs: null };
+    : initial;
   return { best, candidates: all };
 }
 

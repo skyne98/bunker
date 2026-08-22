@@ -746,3 +746,27 @@ round-trip. 300 -> 302-306 tok/s, Match 31/31 x3. GPU/step ~3.0ms.
 Also: BK=512 probe on down/outp/o was NEGATIVE (285 vs 300) - BK=256 confirmed
 optimal (like BN=16). lm_head left alone (already ~93% HBM BW, no headroom).
 Session total now 176 -> ~305 tok/s (+73%), all bit-exact.
+
+## 2025-08-22 — tile search added to explore(): fusions/discovery, not hand-picked
+
+Per the "no hardcoded fusion sequences" principle, the knob-tuning I had been
+doing by hand (BN=16/BK=256 for decode GEMMs, swiglu-into-gate) is now a
+SEARCHED move dimension in the existing fusion explorer:
+
+- src/fusion.ts: Candidate gains per-GEMM `tiles: TileAssign`; new `tile`
+  move (one GEMM, one config at a time, only bit-exact configs that divide);
+  `candKey` includes tiles (identity/dedupe); `codegenGroup` derives the
+  launch grid from the searched tile for single-GEMM kernels (grid.y =
+  ceil(N/BN)) so BN != 64 cannot compute only a fraction of columns;
+  `resolveGemmTile` shared by codegen+emitter so they cannot diverge;
+  `compilePartition(graph, partition, tiles)`. Backward-compatible: existing
+  callers (runner, fusion_model_full) pass no tiles and get default 64x64.
+- src/policy.ts (new): measured (partition, tiles) -> JSON policy with graph
+  signature guard (stale policy refuses to replay), round-trip verified.
+- tests/test_fusion_search.ts (new, PURE/no GPU): move legality + count,
+  key identity incl. tiles, grid derivation, resolve clamping, policy
+  round-trip + stale-graph guard. ALL PASS.
+- bench/autotune_decode.ts (new): end-to-end discovery on the real GPU.
+  Result: explore(moves:["tile"]) DISCOVERED BN=16 x BK=256 for the layer-0
+  qkv GEMM (0.025ms vs 0.028ms default) — the same optimum I had hand-picked,
+  now found automatically and persisted via policy.
