@@ -95,11 +95,13 @@ static void initAllTargets() {
 #endif
 
 // Path to NVIDIA's libdevice.10.bc (device math: __nv_sqrtf, __nv_logf, ...).
-// Defaults to the Triton-vendored copy (ABI-matched to this build's LLVM).
-// Override with TRITON_LIBDEVICE env var at runtime.
+// The old default pointed at a python-triton Nix path that no longer exists
+// (GC'd) and failed to parse; point at the CUDA nvcc-vendored copy instead.
+// Override with TRITON_LIBDEVICE env var at runtime (src/ttir.ts auto-resolves
+// this from /nix/store when the env var is unset).
 #ifndef TRITON_LIBDEVICE_PATH
 #define TRITON_LIBDEVICE_PATH \
-  "/nix/store/5lxy0mn9vj7s6xr97jvdgk2b2vxm743j-python3.14-triton-3.7.0/lib/python3.14/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+  "/nix/store/1q78lqxpqmdnzixdbi45j93lb7cw7598-cuda12.9-cuda_nvcc-12.9.86/nvvm/libdevice/libdevice.10.bc"
 #endif
 
 // Link NVIDIA's libdevice bitcode into the LLVM module so calls to __nv_*

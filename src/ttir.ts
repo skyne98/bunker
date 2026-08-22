@@ -22,6 +22,32 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { dlopen, ptr as ffiPtr, CString } from "bun:ffi";
 
+// ════════════════════════════════════════════════════════════════
+// NVIDIA libdevice auto-resolution
+// ════════════════════════════════════════════════════════════════
+// The shim links libdevice (sqrt/log/sin/cos/tanh) and honors the
+// TRITON_LIBDEVICE env var; its compiled-in default is stale. Resolve a
+// valid libdevice.10.bc from the Nix store when the env var is unset, the
+// same way findPtxas() locates ptxas below.
+if (!process.env.TRITON_LIBDEVICE) {
+  let found: string | null = null;
+  try {
+    for (const d of readdirSync("/nix/store")) {
+      if (!d.includes("cuda") || !d.includes("nvcc")) continue;
+      const p = `/nix/store/${d}/nvvm/libdevice/libdevice.10.bc`;
+      if (existsSync(p)) { found = p; break; }
+    }
+  } catch {}
+  if (found) {
+    try {
+      // bun's process.env is virtualized and never reaches C getenv(), so set
+      // the REAL process environment via libc setenv before the shim loads.
+      const libc = dlopen("libc.so.6", { setenv: { args: ["ptr", "ptr", "i32"], returns: "i32" } });
+      libc.symbols.setenv(ffiPtr(Buffer.from("TRITON_LIBDEVICE\0")), ffiPtr(Buffer.from(found + "\0")), 1);
+    } catch {}
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Type model
 // ═══════════════════════════════════════════════════════════════════
@@ -213,6 +239,11 @@ export function cu() {
       cuStreamSynchronize: { args: ["i64"], returns: "i32" },
       cuLaunchKernel: { args: ["i64", "u32", "u32", "u32", "u32", "u32", "u32", "u32", "ptr", "ptr", "ptr"], returns: "i32" },
       cuCtxSynchronize: { args: [], returns: "i32" },
+      cuEventCreate: { args: ["ptr", "u32"], returns: "i32" },
+      cuEventRecord: { args: ["i64", "i64"], returns: "i32" },
+      cuEventSynchronize: { args: ["i64"], returns: "i32" },
+      cuEventElapsedTime: { args: ["ptr", "i64", "i64"], returns: "i32" },
+      cuEventDestroy: { args: ["i64"], returns: "i32" },
       cuMemFree_v2: { args: ["i64"], returns: "i32" },
     }).symbols;
     _cuda.cuInit(0);
@@ -289,6 +320,11 @@ export function cuCopySync(): number { return cu().cuStreamSynchronize(copyStrea
 /** Launch a loaded kernel. `args` is an array of BigInt device pointers and numbers. */
 export function cuLaunch(k: LoadedKernel, grid: [number,number,number], block: [number,number,number], args: (bigint | number)[]): number {
   const cs = cu();
+  let pe: { start: bigint; end: bigint } | null = null;
+  if (GPU_PROF) {
+    pe = profEventPair();
+    if (pe) cs.cuEventRecord(pe.start, 0n);
+  }
   // Pack scalar args into a flat buffer (8 bytes each) and build a pointer array.
   const n = args.length;
   const slot = Buffer.alloc(n * 8);
@@ -303,10 +339,82 @@ export function cuLaunch(k: LoadedKernel, grid: [number,number,number], block: [
   const pp = Number(ffiPtr(padded));
   const kp = Buffer.alloc((n + 4) * 8);
   for (let i = 0; i < n + 3; i++) kp.writeBigUInt64LE(BigInt(pp + i * 8), i * 8);
-  return cs.cuLaunchKernel(k.fn, grid[0], grid[1], grid[2], block[0], block[1], block[2], k.shmem, 0n, ffiPtr(kp), null);
+  const rc = cs.cuLaunchKernel(k.fn, grid[0], grid[1], grid[2], block[0], block[1], block[2], k.shmem, 0n, ffiPtr(kp), null);
+  if (pe) {
+    cs.cuEventRecord(pe.end, 0n);
+    _pendingEvents.push({ start: pe.start, end: pe.end, key: _fnLabels.get(k.fn) ?? `fn${k.fn}` });
+  }
+  return rc;
 }
 
 export interface LoadedKernel { module: number; fn: number; shmem: number; }
+
+// ── Optional per-kernel GPU timing (CUDA events) ──────────────────
+// Gated by BUNKER_GPU_PROF=1. Records a start/end event pair around every
+// cuLaunch on the default stream; profGpuReport() syncs the context, reads
+// the elapsed GPU time per kernel with cuEventElapsedTime, and prints a
+// breakdown. Purpose-built because perf tools (nsys) cannot attach to bun's
+// process; this gives the same kernel-level picture from inside the runtime.
+const GPU_PROF = process.env.BUNKER_GPU_PROF === "1";
+const _fnLabels = new Map<number, string>();
+const _profTotal = new Map<string, { ns: number; count: number }>();
+let _pendingEvents: { start: bigint; end: bigint; key: string }[] = [];
+let _eventPool: { start: bigint; end: bigint }[] = [];
+
+function profEventPair(): { start: bigint; end: bigint } | null {
+  const cs = cu();
+  if (_eventPool.length) return _eventPool.pop()!;
+  // Refill in bulk: per-launch cuEventCreate is expensive and distorts the
+  // very measurement being taken (all events are created once, then reused
+  // from the pool until profGpuReport destroys them and re-creates).
+  const make = (): bigint => {
+    const e = Buffer.alloc(8);
+    if (cs.cuEventCreate(e, 0) !== 0) return 0n;
+    return e.readBigUInt64LE(0);
+  };
+  for (let i = 0; i < 8192; i++) {
+    const s = make(), en = make();
+    if (s === 0n || en === 0n) break;
+    _eventPool.push({ start: s, end: en });
+  }
+  if (!_eventPool.length) return null;
+  return _eventPool.pop()!;
+}
+
+/** Reset the per-kernel GPU profiler counters (start of a timed region). */
+export function profGpuReset(): void {
+  _pendingEvents = [];
+  _profTotal.clear();
+}
+
+/** Sync the GPU and print the per-kernel elapsed-time breakdown. */
+export function profGpuReport(): void {
+  if (!GPU_PROF) return;
+  const cs = cu();
+  cs.cuCtxSynchronize();
+  const elapsed = new Float32Array(1);
+  for (const pe of _pendingEvents) {
+    if (cs.cuEventElapsedTime(elapsed, pe.start, pe.end) === 0) {
+      const cur = _profTotal.get(pe.key) ?? { ns: 0, count: 0 };
+      cur.ns += Math.round(elapsed[0] * 1e6); // ms -> ns
+      cur.count += 1;
+      _profTotal.set(pe.key, cur);
+    }
+    cs.cuEventDestroy(pe.start);
+    cs.cuEventDestroy(pe.end);
+  }
+  _pendingEvents = [];
+  const rows = [..._profTotal.entries()].sort((a, b) => b[1].ns - a[1].ns);
+  let totalNs = 0;
+  for (const [, v] of rows) totalNs += v.ns;
+  console.log("\n── BUNKER_GPU_PROF (kernel elapsed, default stream) ──");
+  for (const [key, v] of rows.slice(0, 25)) {
+    const share = totalNs ? (v.ns / totalNs * 100).toFixed(1) : "0";
+    const per = v.count ? (v.ns / v.count / 1e3).toFixed(1) : "0";
+    console.log(`  ${(v.ns / 1e6).toFixed(2).padStart(8)}ms  ${(v.ns / totalNs * 100).toFixed(1).padStart(5)}%  x${String(v.count).padStart(4)}  avg ${per.padStart(6)}us  ${key}`);
+  }
+  console.log(`  ${(totalNs / 1e6).toFixed(2)}ms total GPU (${rows.length} distinct kernels)\n`);
+}
 
 /** Find ptxas on the system (PATH, then common Nix store locations). */
 function findPtxas(): string | null {
@@ -334,7 +442,7 @@ export function setTargetArch(arch: string): void { _defaultArch = arch; }
  * falls back to assembling via `ptxas` → cubin and loading the cubin, which
  * is always reliable. Throws if both paths fail.
  */
-export function loadPTX(ptx: string, funcName: string, shmem: number): LoadedKernel {
+export function loadPTX(ptx: string, funcName: string, shmem: number, label?: string): LoadedKernel {
   const cs = cuda();
   const img = Buffer.from(ptx + "\0", "utf-8");
   const mod = Buffer.alloc(8);
@@ -371,13 +479,15 @@ export function loadPTX(ptx: string, funcName: string, shmem: number): LoadedKer
   if (gfr !== 0) throw new Error(`cuModuleGetFunction(${funcName}) failed: rc=${gfr}`);
   // Allow the kernel's dynamic shared memory allocation.
   if (shmem > 0) cs.cuFuncSetAttribute(Number(fn.readBigUInt64LE(0)), 8, shmem);
-  return { module: Number(mod.readBigUInt64LE(0)), fn: Number(fn.readBigUInt64LE(0)), shmem };
+  const k: LoadedKernel = { module: Number(mod.readBigUInt64LE(0)), fn: Number(fn.readBigUInt64LE(0)), shmem };
+  if (GPU_PROF) _fnLabels.set(k.fn, label ?? funcName);
+  return k;
 }
 
 /** One-shot: compile TTIR → PTX → load into a CUDA module + function handle. */
-export function compileAndLoad(ttir: string, funcName = "kernel", numWarps = 4): LoadedKernel {
+export function compileAndLoad(ttir: string, funcName = "kernel", numWarps = 4, label?: string): LoadedKernel {
   const { ptx, shmem } = compileTTIR(ttir, numWarps);
-  return loadPTX(ptx, funcName, shmem);
+  return loadPTX(ptx, funcName, shmem, label);
 }
 
 // ═══════════════════════════════════════════════════════════════════
