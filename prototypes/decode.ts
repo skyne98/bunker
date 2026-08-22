@@ -127,14 +127,31 @@ function buildMM(M:number,N:number,K:number,opts?:{cast?:boolean,add?:boolean,N2
   b.store(tpC,storeVal,{boundaryCheck:[0,1]});
   // Second GEMM (shares A, same K-loop)
   if(opts?.N2){
-    const a02=b.zeros([BM,BN2],"f32");
-    const [acc2] = b.forIter(b.index(0),b.index(K),b.index(BK),[a02,tpA,tpB2],(bb,_,[a2,tA2,tB2])=>{
-      const n=bb.dot(bb.load(tA2),bb.load(tB2),a2);
-      return[n,bb.advance(tA2,[bb.i32(0),bb.i32(BK)]),bb.advance(tB2,[bb.i32(BK),bb.i32(0)])];
-    });
-    let result2=acc2;
-    const storeVal2=opts?.cast?b.fptrunc(result2,"bf16"):result2;
-    b.store(tpC2,storeVal2,{boundaryCheck:[0,1]});
+    const nb2=Math.ceil(opts.N2/BN2), nb1=Math.ceil(N/BN);
+    if (nb2 < nb1) {
+      // The second GEMM is narrower than the first: only the first `nb2`
+      // column-blocks compute it (guarded store + compute). Lets tiny dual
+      // GEMMs (e.g. a+b with N2=16) split across several blocks instead of
+      // pinning the whole kernel to one block's launch tail.
+      b.if_(b.lt(pN,b.i32(nb2)),(bb)=>{
+        const a02=bb.zeros([BM,BN2],"f32");
+        const [acc2] = bb.forIter(b.index(0),b.index(K),b.index(BK),[a02,tpA,tpB2],(bb2,_,[a2,tA2,tB2])=>{
+          const n=bb2.dot(bb2.load(tA2),bb2.load(tB2),a2);
+          return[n,bb2.advance(tA2,[bb2.i32(0),bb2.i32(BK)]),bb2.advance(tB2,[bb2.i32(BK),bb2.i32(0)])];
+        });
+        const storeVal2=opts?.cast?bb.fptrunc(acc2,"bf16"):acc2;
+        bb.store(tpC2,storeVal2,{});
+      });
+    } else {
+      const a02=b.zeros([BM,BN2],"f32");
+      const [acc2] = b.forIter(b.index(0),b.index(K),b.index(BK),[a02,tpA,tpB2],(bb,_,[a2,tA2,tB2])=>{
+        const n=bb.dot(bb.load(tA2),bb.load(tB2),a2);
+        return[n,bb.advance(tA2,[bb.i32(0),bb.i32(BK)]),bb.advance(tB2,[bb.i32(BK),bb.i32(0)])];
+      });
+      let result2=acc2;
+      const storeVal2=opts?.cast?b.fptrunc(result2,"bf16"):result2;
+      b.store(tpC2,storeVal2,{boundaryCheck:[0,1]});
+    }
   }
   const numParams=3+(opts?.add?1:0)+(opts?.N2?2:0);
   return b.build("mm",4,numParams);
@@ -778,7 +795,7 @@ const mmF=(M:number,N:number,K:number,opts?:any,label?:string,warps?:number)=>co
 // GDN: qkv+cast, z+cast, a+b dual-GEMM, out_proj+cast+add, down_proj+cast+add
 const kQKV=mmF(1,QKVD,H,{cast:true,BN:16,BK:256},"mm_qkv");           // GEMM+Cast, BN=16 => 384 blocks
 const kZ=mmF(1,ZD,H,{cast:true,BN:16,BK:256},"mm_z");              // GEMM+Cast, BN=16 => 128 blocks
-const kAB=mmF(1,LVH*2,H,{N2:LVH},"mm_ab");                  // Dual GEMM (a+b) — shares input
+const kAB=mmF(1,LVH*2,H,{N2:LVH,BN:8,BK:256},"mm_ab");         // Dual GEMM (a+b), BN=8 => 4 blocks
 const kOutProj=mmF(1,H,ZD,{cast:true,add:true,BN:16,BK:256},"mm_outp");  // GEMM+Cast+Add (residual), BN=16
 // FA2: q+cast, k+cast, v+cast, o+cast+add
 const kQProj=mmF(1,QGATE,H,{cast:true,BN:16,BK:256},"mm_q");       // GEMM+Cast, BN=16 => 256 blocks
@@ -930,7 +947,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       const zB=palloc(ZD*2); // bf16 — GEMM+Cast
       launch(kZ,[1,Math.ceil(ZD/16),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_z.weight"),zB],`z.${layer}`);
       const aP=palloc(LVH*4); const bP=palloc(LVH*4); // f32 — dual GEMM (a+b)
-      launch(kAB,[1,1,1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_a.weight"),aP,wp(W,layer,"linear_attn.in_proj_b.weight"),bP],`ab.${layer}`);
+      launch(kAB,[1,Math.ceil(LVH*2/8),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_a.weight"),aP,wp(W,layer,"linear_attn.in_proj_b.weight"),bP],`ab.${layer}`);
       // Conv1d decode (with conv state)
       const convOut=palloc(QKVD*2);
       launch(kConv1dD,[BLK1(QKVD),1,1],[128,1,1],[qkvB,convStates[layer],wp(W,layer,"linear_attn.conv1d.weight"),convOut,convStatesNew[layer]],`cv1d.${layer}`);

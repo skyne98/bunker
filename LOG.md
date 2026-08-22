@@ -698,3 +698,11 @@ kernels (rms/gdn/fa2a/cv1d/sg/rope) ~0.5ms, mm_outp 0.20, others ~0.4.
 Remaining path to floor (~2.0ms / 500 tok/s): (1) mm_ab + small-kernel launch
 tail, (2) GEMMs still ~1.5-2x off BW-ideal, (3) CUDA Graphs for the ~0.5ms
 tail. lm_head/footprint: token rate now 176 -> 280 = +59% over session start.
+
+## 2025-08-22 — mm_ab: split single-block dual GEMM (BN=8, guarded N2) -> 300 tok/s
+
+mm_ab (a+b, N=32/N2=16) ran as grid [1,1,1] = ONE block -> ~24us launch-tail
+floor. Split to BN=8 (grid [1,4,1]); the second GEMM (N2=16 -> 2 blocks) is
+guarded inside scf.if (b.lt(pN, nb2)) so blocks 2-3 skip it. Bit-exact
+(per-element K-chain unchanged), Match 31/31 x3. 280 -> 296-300 tok/s.
+Session total: 176 -> ~300 tok/s (+70%), all bit-exact.
