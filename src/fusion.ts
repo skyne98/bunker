@@ -16,6 +16,10 @@
 //   * portability: no sm_86/PTX literals here; kernels compile via the shim
 
 import { TTIRBuilder, compileAndLoad, cuLaunch, cuSync, LoadedKernel } from "./ttir";
+
+// Progress-bar glyphs for `explore({ progress: true })`.
+const _BAR_FULL = "█";
+const _BAR_EMPTY = "░";
 import { emitEmbed, emitConv1d, emitGDN, emitQNorm, emitKNorm, emitRoPE, emitRoPEK, emitFA2Attn, emitArgmax } from "./emitters";
 
 // ═══════════════════════════════════════════════════════════════════
@@ -490,8 +494,26 @@ export function compilePartition(graph: Graph, partition: Partition, tiles?: Til
 
 /** Compile + load a partition's kernels into GPU modules. */
 export function loadPartition(plans: KernelPlan[]): { plan: KernelPlan; k: LoadedKernel }[] {
-  return plans.map(p => ({ plan: p, k: compileAndLoad(p.ttir, p.name, 4) }));
+  return plans.map(p => ({ plan: p, k: compileCached(p.ttir, p.name, 4) }));
 }
+
+// ── per-TTIR compile cache ────────────────────────────────────────
+// The same kernel TTIR recurs across candidates (identical tile configs and
+// groups), and TTIR -> PTX compile is the dominant discovery cost. Cache by
+// the exact TTIR text so a repeated kernel is compiled exactly once; this is
+// what keeps a discovery run under a minute instead of tens of minutes.
+export const kernelCache = new Map<string, LoadedKernel>();
+/** Compile a TTIR kernel once per unique text; later calls reuse the module. */
+export function compileCached(ttir: string, name: string, numWarps: number): LoadedKernel {
+  const key = `${numWarps}|${ttir}`;
+  const hit = kernelCache.get(key);
+  if (hit) return hit;
+  const k = compileAndLoad(ttir, name, numWarps);
+  kernelCache.set(key, k);
+  return k;
+}
+/** Drop cached kernels (call when the GPU context is torn down / recreated). */
+export function clearKernelCache(): void { kernelCache.clear(); }
 
 /**
  * Run a partition once on the GPU and measure wall time (ms). Kernels are
@@ -531,6 +553,8 @@ export interface ExploreConfig {
   verbose?: boolean;
   /** if a candidate fails to compile, dump its TTIR for debugging */
   dumpOnError?: boolean;
+  /** print a live progress bar to stderr (evals, elapsed, best-so-far) */
+  progress?: boolean;
 }
 
 /** A candidate = a partition + per-GEMM tiles + its measured latency. */
@@ -664,14 +688,30 @@ export function explore(
   const all: Candidate[] = [];
   const seen = new Set<string>();
 
+  // Progress bar: evals against the budget, elapsed time, and best latency.
+  const t0 = Date.now();
+  let evals = 0;
+  let bestSoFar: number | null = null;
+  const barW = 20;
+  const bar = () => {
+    if (!cfg.progress) return;
+    const pct = Math.min(1, Math.max(0, evals / Math.max(1, budget)));
+    const fill = Math.round(pct * barW);
+    const dt = ((Date.now() - t0) / 1000).toFixed(1);
+    const best = bestSoFar !== null ? bestSoFar.toFixed(3) + "ms" : "—";
+    process.stderr.write(`\r[tune] ${_BAR_FULL.repeat(fill)}${_BAR_EMPTY.repeat(barW - fill)} ${evals}/${budget} · ${dt}s · best ${best}`);
+  };
+
   const evaluate = (c: Candidate): Candidate => {
     const key = candKey(c);
     if (seen.has(key)) return { ...c, latencyMs: null };
     seen.add(key);
+    evals++;
     let latencyMs: number | null = null;
     try {
       const plans = compilePartition(graph, c.partition, c.tiles);
       latencyMs = measurePartition(plans, env, 5);
+      if (latencyMs !== null && (bestSoFar === null || latencyMs < bestSoFar)) bestSoFar = latencyMs;
       if (verbose) console.log(`  ✓ ${c.partition.length} kernels: ${latencyMs.toFixed(3)}ms`);
     } catch (e: any) {
       if (cfg.dumpOnError) {
@@ -683,6 +723,7 @@ export function explore(
       }
       if (verbose) console.log(`  ✗ ${c.partition.length} kernels: ${e.message.split("\n")[0]}`);
     }
+    bar();
     const out: Candidate = { ...c, latencyMs };
     all.push(out);
     return out;
@@ -723,6 +764,8 @@ export function explore(
   const best = evaluated.length
     ? evaluated.sort((a, b) => (a.latencyMs ?? 1e9) - (b.latencyMs ?? 1e9))[0]
     : initial;
+  bar();
+  if (cfg.progress) process.stderr.write("\n");
   return { best, candidates: all };
 }
 
