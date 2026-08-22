@@ -92,6 +92,34 @@ function tokenize(text:string, tokPath:string):Uint32Array {
 // opts.cast: store output as bf16 instead of f32 (fuses Cast into GEMM)
 // opts.add: load residual (bf16), add to output before cast/store (fuses Cast+Add)
 // opts.N2: if set, compute a SECOND GEMM [M,N2,K] with same A but different B2, output to C2 (fuses Gate+Up, A+B)
+// ── Fused gate+up dual GEMM with SwiGLU epilogue ──
+// Computes gate and up for the same 16-col block in one launch, then applies
+// act = bf16(gate*sigmoid(gate)*up) in-register — bit-identical to the old
+// two-kernel path (gate/up f32 -> separate SwiGLU kernel) because the f32
+// values are the same and the epilogue math is unchanged. Removes the sg
+// kernel + the gate/up global round-trip.
+function buildGateSwiglu(N:number, H:number, BN:number, BK:number) {
+  const b=new TTIRBuilder();
+  const A=b.param("A",{ptr:"bf16"}),B=b.param("B",{ptr:"bf16"}),B2=b.param("B2",{ptr:"bf16"}),ACT=b.param("ACT",{ptr:"bf16"});
+  const pN=b.programId(1);
+  const pNB=b.mul(pN,b.i32(BN));
+  const tpA=b.makeTensorPtr(A,[1,H],[H,1],[b.i32(0),b.i32(0)],[1,BK],"bf16",[1,0]);
+  const tpB=b.makeTensorPtr(B,[H,N],[1,H],[b.i32(0),pNB],[BK,BN],"bf16",[0,1]);
+  const tpB2=b.makeTensorPtr(B2,[H,N],[1,H],[b.i32(0),pNB],[BK,BN],"bf16",[0,1]);
+  const a0=b.zeros([1,BN],"f32"); const a02=b.zeros([1,BN],"f32");
+  const [acc]=b.forIter(b.index(0),b.index(H),b.index(BK),[a0,tpA,tpB],(bb,_,[a,tA,tB])=>{
+    const n=bb.dot(bb.load(tA),bb.load(tB),a);
+    return[n,bb.advance(tA,[bb.i32(0),bb.i32(BK)]),bb.advance(tB,[bb.i32(BK),bb.i32(0)])];
+  });
+  const [acc2]=b.forIter(b.index(0),b.index(H),b.index(BK),[a02,tpA,tpB2],(bb,_,[a,tA,tB])=>{
+    const n=bb.dot(bb.load(tA),bb.load(tB),a);
+    return[n,bb.advance(tA,[bb.i32(0),bb.i32(BK)]),bb.advance(tB,[bb.i32(BK),bb.i32(0)])];
+  });
+  const sig=b.divf(b.f32(1),b.add(b.f32(1),b.exp(b.mul(acc,b.f32(-1)))));
+  const tpAct=b.makeTensorPtr(ACT,[1,N],[N,1],[b.i32(0),pNB],[1,BN],"bf16",[1,0]);
+  b.store(tpAct,b.fptrunc(b.mul(b.mul(acc,sig),acc2),"bf16"),{});
+  return b.build("mm",4,4);
+}
 function buildMM(M:number,N:number,K:number,opts?:{cast?:boolean,add?:boolean,N2?:number,BN?:number,BK?:number}) {
   const BM=Math.min(64,M), BN=opts?.BN??Math.min(64,N), BK=opts?.BK??Math.min(64,K);
   const b=new TTIRBuilder();
@@ -802,8 +830,8 @@ const kQProj=mmF(1,QGATE,H,{cast:true,BN:16,BK:256},"mm_q");       // GEMM+Cast,
 const kKVProj=mmF(1,KV_DIM,H,{cast:true,BN:16,BK:256},"mm_kv");   // GEMM+Cast, BN=16 => 32 blocks
 const kOProj=mmF(1,H,NH*HD,{cast:true,add:true,BN:16,BK:256},"mm_o");  // GEMM+Cast+Add, BN=16
 // MLP: gate+up dual-GEMM, down+cast+add
-const kGPUP=mmF(1,INTER,H,{N2:INTER,BN:16,BK:256},"mm_gate");     // Dual GEMM (gate+up), BN=16 => 224 blocks
-const kDP=mmF(1,H,INTER,{cast:true,add:true,BN:16,BK:256},"mm_down"); // BK=256 probe (bit-exact BW)
+const kGPUP=compileAndLoad(buildGateSwiglu(INTER,H,16,256),"mm",4,"mm_gate"); // fused gate+up+SwiGLU
+const kDP=mmF(1,H,INTER,{cast:true,add:true,BN:16,BK:256},"mm_down"); // BN=16 => 64 col blocks (bit-exact BW fix)
 // lm_head (no fusion — argmax reads f32)
 const kLM=mm(1,VOCAB,H,"mm_lm");
 // Fused Cast+Add (for cases where GEMM isn't the producer)
@@ -995,13 +1023,10 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
     const normed2=palloc(H*2);
     launch(kRms,[1,1,1],[128,1,1],[afterAttn,wp(W,layer,"post_attention_layernorm.weight"),normed2],`rms2.${layer}`);
     
-    // MLP — fused gate+up dual GEMM, then SwiGLU, then fused down+Cast+Add
-    const gate=palloc(INTER*4); const up=palloc(INTER*4); // f32 — dual GEMM (gate+up)
-    launch(kGPUP,[1,Math.ceil(INTER/16),1],[128,1,1],[normed2,wp(W,layer,"mlp.gate_proj.weight"),gate,wp(W,layer,"mlp.up_proj.weight"),up],`gpup.${layer}`);
-    pfree(normed2);
+    // MLP — fused gate+up dual GEMM with SwiGLU epilogue (writes act only)
     const act=palloc(INTER*2);
-    launch(kSg,[BLK1(INTER),1,1],[128,1,1],[gate,up,act],`sg.${layer}`);
-    pfree(gate); pfree(up);
+    launch(kGPUP,[1,Math.ceil(INTER/16),1],[128,1,1],[normed2,wp(W,layer,"mlp.gate_proj.weight"),wp(W,layer,"mlp.up_proj.weight"),act],`gpup.${layer}`);
+    pfree(normed2);
     // Fused down_proj+Cast+Add: output = bf16(act @ W + afterAttn)
     x=palloc(H*2); // bf16 output with residual
     launch(kDP,[1,Math.ceil(H/16),1],[128,1,1],[act,wp(W,layer,"mlp.down_proj.weight"),x,afterAttn],`dp.${layer}`);

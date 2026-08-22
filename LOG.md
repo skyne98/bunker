@@ -736,3 +736,13 @@ this bun (1.3.13). A host-side runner (C wrapper) could do graphs, but that's
 a shim change out of scope. Accept 300 tok/s (bit-exact); the ~5-10% launch
 tail stays. This is consistent with the megakernels research: the real fix for
 boundary cost is a persistent/device-side loop, not graph replay via ffi.
+
+## 2025-08-22 — swiglu fused into gate/up epilogue -> 306 tok/s (+2%)
+
+buildGateSwiglu: one launch computes gate, up AND act=bf16(gate*sigmoid(gate)*up)
+in-register (per-16-col block). Bit-identical to the old 2-kernel path (same
+f32 acc values, same epilogue math); removes the sg kernel + gate/up global
+round-trip. 300 -> 302-306 tok/s, Match 31/31 x3. GPU/step ~3.0ms.
+Also: BK=512 probe on down/outp/o was NEGATIVE (285 vs 300) - BK=256 confirmed
+optimal (like BN=16). lm_head left alone (already ~93% HBM BW, no headroom).
+Session total now 176 -> ~305 tok/s (+73%), all bit-exact.
