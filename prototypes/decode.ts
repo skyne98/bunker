@@ -2,7 +2,7 @@
 // Generates text token-by-token with proper state carry for GDN (recurrent state + conv state)
 // and FA2 (KV cache + RoPE).
 //   TOKENIZER_PATH=/tmp/tokenizer.json SAFETENSORS_PATH=/tmp/qwen35_0.8b.safetensors bun run prototypes/decode.ts "Hello"
-import { TTIRBuilder, compileAndLoad, cuAlloc, cuHtoD as _cuHtoD, cuDtoH as _cuDtoH, cuFree, cuSync as _cuSync, cuLaunch as _cuLaunch } from "../src/ttir";
+import { TTIRBuilder, compileAndLoad, cuAlloc, cuHtoD as _cuHtoD, cuDtoH as _cuDtoH, cuFree, cuSync as _cuSync, cuLaunch as _cuLaunch, profGpuReport } from "../src/ttir";
 import { dlopen, ptr as ffiPtr } from "bun:ffi";
 import { performance } from "perf_hooks";
 
@@ -92,8 +92,8 @@ function tokenize(text:string, tokPath:string):Uint32Array {
 // opts.cast: store output as bf16 instead of f32 (fuses Cast into GEMM)
 // opts.add: load residual (bf16), add to output before cast/store (fuses Cast+Add)
 // opts.N2: if set, compute a SECOND GEMM [M,N2,K] with same A but different B2, output to C2 (fuses Gate+Up, A+B)
-function buildMM(M:number,N:number,K:number,opts?:{cast?:boolean,add?:boolean,N2?:number}) {
-  const BM=Math.min(64,M),BN=Math.min(64,N),BK=Math.min(64,K);
+function buildMM(M:number,N:number,K:number,opts?:{cast?:boolean,add?:boolean,N2?:number,BN?:number}) {
+  const BM=Math.min(64,M), BN=opts?.BN??Math.min(64,N), BK=Math.min(64,K);
   const b=new TTIRBuilder();
   const outElem=opts?.cast?"bf16":"f32";
   const A=b.param("A",{ptr:"bf16"}),B=b.param("B",{ptr:"bf16"});
@@ -110,7 +110,7 @@ function buildMM(M:number,N:number,K:number,opts?:{cast?:boolean,add?:boolean,N2
   if(opts?.add){const R=params[3];tpR=b.makeTensorPtr(R,[M,N],[N,1],[b.mul(pM,b.i32(BM)),b.mul(pN,b.i32(BN))],[BM,BN],"bf16",[1,0]);}
   // Second GEMM pointers (if N2)
   let tpB2:any=null,tpC2:any=null,BN2=0;
-  if(opts?.N2){BN2=Math.min(64,opts.N2);const B2=params[opts?.add?4:3],C2=params[opts?.add?5:4];
+  if(opts?.N2){BN2=opts.BN??Math.min(64,opts.N2);const B2=params[opts?.add?4:3],C2=params[opts?.add?5:4];
     tpB2=b.makeTensorPtr(B2,[K,opts.N2],[1,K],[b.i32(0),b.mul(pN,b.i32(BN2))],[BK,BN2],"bf16",[0,1]);
     tpC2=b.makeTensorPtr(C2,[M,opts.N2],[opts.N2,1],[b.mul(pM,b.i32(BM)),b.mul(pN,b.i32(BN2))],[BM,BN2],outElem,[1,0]);}
   // Main GEMM
@@ -139,6 +139,7 @@ function buildMM(M:number,N:number,K:number,opts?:{cast?:boolean,add?:boolean,N2
   const numParams=3+(opts?.add?1:0)+(opts?.N2?2:0);
   return b.build("mm",4,numParams);
 }
+
 // ── Fused Cast+Add: y = cast(a) + b  (saves 1 launch + 1 intermediate buffer) ──
 function buildCastAdd(N:number) {
   const b=new TTIRBuilder();
@@ -689,63 +690,59 @@ function buildFA2Decode() {
   return b.build("fa2_d",4,10);
 }
 
-// ── GPU argmax: finds index of max value in logits [VOCAB] f32 ──
-// Grid: [1]. Loops over chunks of 4096, tracks global max + index.
+// ── GPU argmax: two-stage PARALLEL reduction over logits [VOCAB] f32 ──
+// Stage 1 (buildArgmax, grid [SPLIT]): each program reduces a contiguous
+// VOCAB/SPLIT range. The range is power-of-two padded to 2048 with -inf via an
+// explicit mask (NOT load-NaN padding), so the max reducer sees only real
+// values — fully deterministic. SPLIT*2048 > VOCAB; the tail blocks hold -inf.
+// Stage 2 (buildArgmaxComb, grid [1]): walks the SPLIT partials sequentially
+// with a strict-> winner update (keeps the LOWEST index on ties), exactly the
+// semamtics of the old single-block argmax, so results match the reference.
+const ARGMAX_SPLIT = 128;
+const ARGMAX_PER = 2048; // power-of-two tile per block
+const ARGMAX_NEGINF = -3.40282347e38;
 function buildArgmax() {
   const b=new TTIRBuilder();
-  const L=b.param("L",{ptr:"f32"}),OutVal=b.param("V",{ptr:"f32"}),OutIdx=b.param("I",{ptr:"i32"});
-  const CHUNK=4096;
-  const initMax=b.broadcastTo(b.f32(-1e30),[1]);
-  const initIdx=b.broadcastTo(b.i32(0),[1]);
-  const [finalMax,finalIdx]=b.forIter(b.index(0),b.index(VOCAB),b.index(CHUNK),[initMax,initIdx],(bb,i,[curMax,curIdx])=>{
-    const tp=bb.makeTensorPtr(L,[1,VOCAB],[VOCAB,1],[b.i32(0),i],[1,CHUNK],"f32",[1,0]);
-    const chunk=bb.load(tp,{boundaryCheck:[0,1],padding:1});
-    const localMax=bb.max(chunk,1); // [1]
-    // Find index of local max within chunk
-    const mask=bb.eq(chunk,bb.broadcastTo(localMax,[1,CHUNK])); // [1, CHUNK] i1
-    const arange=bb.arange(0,CHUNK); // [CHUNK] i32
-    const arangeBc=bb.broadcast(bb.expandDims(arange,0),[1,CHUNK]); // [1, CHUNK] i32
-    const masked=bb.select(mask,arangeBc,bb.broadcastTo(bb.i32(0),[1,CHUNK])); // [1, CHUNK] i32
-    const localIdx=bb.sum(masked,1); // [1] i32
-    const globalIdx=bb.add(localIdx,bb.broadcastTo(i,[1])); // [1] i32
-    // Update global max if local is better
-    const isBetter=bb.gt(localMax,curMax); // [1] i1
-    const newMax=bb.select(isBetter,localMax,curMax); // [1] f32
-    const newIdx=bb.select(isBetter,globalIdx,curIdx); // [1] i32
-    return [newMax,newIdx];
-  });
-  b.store(OutVal,finalMax);
-  b.store(OutIdx,finalIdx);
-  return b.build("argmax",4,3);
+  const L=b.param("L",{ptr:"f32"}),PV=b.param("PV",{ptr:"f32"}),PI=b.param("PI",{ptr:"i32"});
+  const pid=b.programId(0);
+  const start=b.mul(pid,b.i32(ARGMAX_PER));
+  const idxBase=b.add(start,b.arange(0,ARGMAX_PER)); // [PER] i32 global indices
+  const mask=b.lt(idxBase,b.i32(VOCAB)); // [PER] i1 — false past the vocab end
+  const ptrs=b.addptr(b.splatPtr(L,ARGMAX_PER,"f32"),idxBase); // [PER] !tt.ptr<f32>
+  const chunk1=b.load(ptrs,{mask,other:b.splat(b.f32(ARGMAX_NEGINF),[ARGMAX_PER],"f32")}); // [PER] f32, -inf padded
+  const chunk=b.expandDims(chunk1,0); // [1, PER]
+  const localMax=b.max(chunk,1); // [1]
+  // Index of the block-local max within the block's range (unique-max assumption).
+  const maskV=b.eq(chunk,b.broadcastTo(localMax,[1,ARGMAX_PER]));
+  const arangeBc=b.broadcast(b.expandDims(b.arange(0,ARGMAX_PER),0),[1,ARGMAX_PER]);
+  const localIdx=b.sum(b.select(maskV,arangeBc,b.broadcastTo(b.i32(0),[1,ARGMAX_PER])),1); // [1]
+  const globalIdx=b.add(localIdx,b.broadcastTo(start,[1])); // [1]
+  const tpPV=b.makeTensorPtr(PV,[1,ARGMAX_SPLIT],[ARGMAX_SPLIT,1],[b.i32(0),pid],[1,1],"f32",[1,0]);
+  const tpPI=b.makeTensorPtr(PI,[1,ARGMAX_SPLIT],[ARGMAX_SPLIT,1],[b.i32(0),pid],[1,1],"i32",[1,0]);
+  b.store(tpPV,b.broadcastTo(localMax,[1,1]),{});
+  b.store(tpPI,b.broadcastTo(globalIdx,[1,1]),{});
+  return b.build("argmaxp",4,3);
 }
-
-// ── GPU argmax: finds index of max value in logits [VOCAB] f32 ──
-// Grid: [1]. Loops over chunks of 4096, tracks global max + index.
-function buildArgmax() {
+function buildArgmaxComb() {
   const b=new TTIRBuilder();
-  const L=b.param("L",{ptr:"f32"}),OutVal=b.param("V",{ptr:"f32"}),OutIdx=b.param("I",{ptr:"i32"});
-  const CHUNK=4096;
-  const tpL=b.makeTensorPtr(L,[1,VOCAB],[VOCAB,1],[b.i32(0),b.i32(0)],[1,CHUNK],"f32",[1,0]);
-  const initMax=b.broadcastTo(b.f32(-1000),[1]);
-  const initIdx=b.broadcastTo(b.i32(0),[1]);
-  const initOff=b.broadcastTo(b.i32(0),[1]);
-  const [finalMax,finalIdx]=b.forIter(b.index(0),b.index(VOCAB),b.index(CHUNK),[initMax,initIdx,initOff,tpL],(bb,_,[curMax,curIdx,curOff,tp])=>{
-    const chunk=bb.load(tp,{boundaryCheck:[0,1],padding:1});
-    const localMax=bb.max(chunk,1);
-    const mask=bb.eq(chunk,bb.broadcastTo(localMax,[1,CHUNK]));
-    const arange=bb.arange(0,CHUNK);
-    const arangeBc=bb.broadcast(bb.expandDims(arange,0),[1,CHUNK]);
-    const masked=bb.select(mask,arangeBc,bb.broadcastTo(bb.i32(0),[1,CHUNK]));
-    const localIdx=bb.sum(masked,1);
-    const globalIdx=bb.add(localIdx,curOff);
-    const isBetter=bb.gt(localMax,curMax);
-    const newMax=bb.select(isBetter,localMax,curMax);
-    const newIdx=bb.select(isBetter,globalIdx,curIdx);
-    return [newMax,newIdx,bb.add(curOff,bb.broadcastTo(bb.i32(CHUNK),[1])),bb.advance(tp,[bb.i32(0),bb.i32(CHUNK)])];
+  const PV=b.param("PV",{ptr:"f32"}),PI=b.param("PI",{ptr:"i32"}),OutVal=b.param("V",{ptr:"f32"}),OutIdx=b.param("I",{ptr:"i32"});
+  const initMax=b.broadcastTo(b.f32(ARGMAX_NEGINF),[1,1]);
+  const initIdx=b.broadcastTo(b.i32(0),[1,1]);
+  // Sequential strict-> scan over the 128 partials: keeps the lowest-index winner.
+  const [gMax,gIdx]=b.forIter(b.index(0),b.index(ARGMAX_SPLIT),b.index(1),[initMax,initIdx],(bb,i,[curMax,curIdx])=>{
+    const ii=bb.indexCast(i,"i32");
+    const tpV=bb.makeTensorPtr(PV,[1,ARGMAX_SPLIT],[ARGMAX_SPLIT,1],[b.i32(0),ii],[1,1],"f32",[1,0]);
+    const tpI=bb.makeTensorPtr(PI,[1,ARGMAX_SPLIT],[ARGMAX_SPLIT,1],[b.i32(0),ii],[1,1],"i32",[1,0]);
+    const v=bb.load(tpV,{});      // [1,1]
+    const cand=bb.load(tpI,{});   // [1,1]
+    const better=bb.gt(v,curMax);
+    return [bb.select(better,v,curMax),bb.select(better,cand,curIdx)];
   });
-  b.store(b.makeTensorPtr(OutVal,[1,1],[1,1],[b.i32(0),b.i32(0)],[1,1],"f32",[1,0]),b.broadcastTo(finalMax,[1,1]),{boundaryCheck:[0,1]});
-  b.store(b.makeTensorPtr(OutIdx,[1,1],[1,1],[b.i32(0),b.i32(0)],[1,1],"i32",[1,0]),b.broadcastTo(finalIdx,[1,1]),{boundaryCheck:[0,1]});
-  return b.build("argmax",4,3);
+  const tpO=b.makeTensorPtr(OutVal,[1,1],[1,1],[b.i32(0),b.i32(0)],[1,1],"f32",[1,0]);
+  const tpOI=b.makeTensorPtr(OutIdx,[1,1],[1,1],[b.i32(0),b.i32(0)],[1,1],"i32",[1,0]);
+  b.store(tpO,b.broadcastTo(gMax,[1,1]),{});
+  b.store(tpOI,b.broadcastTo(gIdx,[1,1]),{});
+  return b.build("argmaxc",4,4);
 }
 
 function launch(k:any,g:number[],bl:number[],args:any[],label:string) {
@@ -776,22 +773,22 @@ console.log(`prompt: "${prompt}" → ${tokenIds.length} tokens: [${tokenIds}]`);
 // Compile kernels
 console.log("compiling kernels...");
 // Fused GEMM variants — automatically fuse Cast/Add/dual-GEMM into the epilogue
-const mm=(M:number,N:number,K:number,opts?:any)=>compileAndLoad(buildMM(M,N,K,opts),"mm",4);
-const mmF=(M:number,N:number,K:number,opts?:any)=>compileAndLoad(buildMM(M,N,K,opts),"mm",4);
+const mm=(M:number,N:number,K:number,opts?:any,label?:string,warps?:number)=>compileAndLoad(buildMM(M,N,K,opts),"mm",warps??4,label??"mm");
+const mmF=(M:number,N:number,K:number,opts?:any,label?:string,warps?:number)=>compileAndLoad(buildMM(M,N,K,opts),"mm",warps??4,label??"mm");
 // GDN: qkv+cast, z+cast, a+b dual-GEMM, out_proj+cast+add, down_proj+cast+add
-const kQKV=mmF(1,QKVD,H,{cast:true});                     // GEMM+Cast (output bf16)
-const kZ=mmF(1,ZD,H,{cast:true});                          // GEMM+Cast
-const kAB=mmF(1,LVH*2,H,{N2:LVH});                         // Dual GEMM (a+b) — shares input
-const kOutProj=mmF(1,H,ZD,{cast:true,add:true});           // GEMM+Cast+Add (residual)
+const kQKV=mmF(1,QKVD,H,{cast:true,BN:16},"mm_qkv");           // GEMM+Cast, BN=16 => 384 blocks
+const kZ=mmF(1,ZD,H,{cast:true,BN:16},"mm_z");              // GEMM+Cast, BN=16 => 128 blocks
+const kAB=mmF(1,LVH*2,H,{N2:LVH},"mm_ab");                  // Dual GEMM (a+b) — shares input
+const kOutProj=mmF(1,H,ZD,{cast:true,add:true,BN:16},"mm_outp");  // GEMM+Cast+Add (residual), BN=16
 // FA2: q+cast, k+cast, v+cast, o+cast+add
-const kQProj=mmF(1,QGATE,H,{cast:true});                   // GEMM+Cast
-const kKVProj=mmF(1,KV_DIM,H,{cast:true});                 // GEMM+Cast (k and v)
-const kOProj=mmF(1,H,NH*HD,{cast:true,add:true});          // GEMM+Cast+Add
+const kQProj=mmF(1,QGATE,H,{cast:true,BN:16},"mm_q");       // GEMM+Cast, BN=16 => 256 blocks
+const kKVProj=mmF(1,KV_DIM,H,{cast:true,BN:16},"mm_kv");   // GEMM+Cast, BN=16 => 32 blocks
+const kOProj=mmF(1,H,NH*HD,{cast:true,add:true,BN:16},"mm_o");  // GEMM+Cast+Add, BN=16
 // MLP: gate+up dual-GEMM, down+cast+add
-const kGPUP=mmF(1,INTER,H,{N2:INTER});                     // Dual GEMM (gate+up)
-const kDP=mmF(1,H,INTER,{cast:true,add:true});              // GEMM+Cast+Add
+const kGPUP=mmF(1,INTER,H,{N2:INTER,BN:16},"mm_gate");     // Dual GEMM (gate+up), BN=16 => 224 blocks
+const kDP=mmF(1,H,INTER,{cast:true,add:true,BN:16},"mm_down"); // BN=16 => 64 col blocks (bit-exact BW fix)
 // lm_head (no fusion — argmax reads f32)
-const kLM=mm(1,VOCAB,H);
+const kLM=mm(1,VOCAB,H,"mm_lm");
 // Fused Cast+Add (for cases where GEMM isn't the producer)
 const kCastAdd=compileAndLoad(buildCastAdd(H),"ca",4);
 const kRms=compileAndLoad(buildRMS(H),"rms",4);
@@ -812,8 +809,11 @@ const kRoPEK=compileAndLoad(buildRoPEKInPlace(),"ropek",4);
 const kQNorm=compileAndLoad(buildQNorm(),"qn",4);
 const kKNormD=compileAndLoad(buildKNormD(),"knormd",4);
 const kFA2A=compileAndLoad(buildFA2Attn(),"fa2a",4);
-const kArgmax=compileAndLoad(buildArgmax(),"argmax",4);
+const kArgmax=compileAndLoad(buildArgmax(),"argmaxp",4);
+const kArgmaxC=compileAndLoad(buildArgmaxComb(),"argmaxc",4);
 const kEmb=compileAndLoad(buildEmbed(),"emb",4);
+const argmaxPV=cuAlloc(BigInt(ARGMAX_SPLIT*4)); // f32 partial maxes
+const argmaxPI=cuAlloc(BigInt(ARGMAX_SPLIT*4)); // i32 partial indices
 const argmaxVal=cuAlloc(BigInt(4)); // f32 max value
 const argmaxIdx=cuAlloc(BigInt(4)); // i32 argmax index
 // Precompute RoPE cos/sin tables [MAX_LEN, 32] f32
@@ -926,9 +926,9 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
     if (!full) {
       // GDN decode — fused GEMMs (Cast epilogue, dual A+B, Cast+Add for out_proj)
       const qkvB=palloc(QKVD*2); // bf16 — GEMM+Cast outputs bf16 directly
-      launch(kQKV,[1,Math.ceil(QKVD/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_qkv.weight"),qkvB],`qkv.${layer}`);
+      launch(kQKV,[1,Math.ceil(QKVD/16),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_qkv.weight"),qkvB],`qkv.${layer}`);
       const zB=palloc(ZD*2); // bf16 — GEMM+Cast
-      launch(kZ,[1,Math.ceil(ZD/64),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_z.weight"),zB],`z.${layer}`);
+      launch(kZ,[1,Math.ceil(ZD/16),1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_z.weight"),zB],`z.${layer}`);
       const aP=palloc(LVH*4); const bP=palloc(LVH*4); // f32 — dual GEMM (a+b)
       launch(kAB,[1,1,1],[128,1,1],[normed,wp(W,layer,"linear_attn.in_proj_a.weight"),aP,wp(W,layer,"linear_attn.in_proj_b.weight"),bP],`ab.${layer}`);
       // Conv1d decode (with conv state)
@@ -943,16 +943,16 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       pfree(convOut); pfree(zB); pfree(aP); pfree(bP);
       // Fused out_proj+Cast+Add: output = bf16(gdnOut @ W + x)
       afterAttn=palloc(H*2); // bf16 output with residual
-      launch(kOutProj,[1,Math.ceil(H/64),1],[128,1,1],[gdnOut,wp(W,layer,"linear_attn.out_proj.weight"),afterAttn,x],`op.${layer}`);
+      launch(kOutProj,[1,Math.ceil(H/16),1],[128,1,1],[gdnOut,wp(W,layer,"linear_attn.out_proj.weight"),afterAttn,x],`op.${layer}`);
       pfree(gdnOut); pfree(x);
     } else {
       // Fused FA2: Q+Cast, K+Cast, V+Cast, O+Cast+Add — ALL on GPU
       const qgB=palloc(QGATE*2); // bf16 — GEMM+Cast
-      launch(kQProj,[1,Math.ceil(QGATE/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.q_proj.weight"),qgB],`qp.${layer}`);
+      launch(kQProj,[1,Math.ceil(QGATE/16),1],[128,1,1],[normed,wp(W,layer,"self_attn.q_proj.weight"),qgB],`qp.${layer}`);
       const vB=palloc(KV_DIM*2); // bf16 — GEMM+Cast
-      launch(kKVProj,[1,Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.v_proj.weight"),vB],`vp.${layer}`);
+      launch(kKVProj,[1,Math.ceil(KV_DIM/16),1],[128,1,1],[normed,wp(W,layer,"self_attn.v_proj.weight"),vB],`vp.${layer}`);
       const kB=palloc(KV_DIM*2); // bf16 — GEMM+Cast
-      launch(kKVProj,[1,Math.ceil(KV_DIM/64),1],[128,1,1],[normed,wp(W,layer,"self_attn.k_proj.weight"),kB],`kp.${layer}`);
+      launch(kKVProj,[1,Math.ceil(KV_DIM/16),1],[128,1,1],[normed,wp(W,layer,"self_attn.k_proj.weight"),kB],`kp.${layer}`);
       // q_norm → QBuf, then GPU RoPE in-place
       launch(kQNorm,[NH,1,1],[128,1,1],[qgB,wp(W,layer,"self_attn.q_norm.weight"),qBuf],`qn.${layer}`);
       launch(kRoPE,[NH,1,1],[128,1,1],[qBuf,ropeCosD,ropeSinD,step],`rope.${layer}`);
@@ -967,7 +967,7 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
       pfree(qgB); pfree(vB); pfree(kB); pfree(kNormB);
       // Fused o_proj+Cast+Add: output = bf16(fa2Out @ W + x)
       afterAttn=palloc(H*2); // bf16 output with residual
-      launch(kOProj,[1,Math.ceil(H/64),1],[128,1,1],[fa2Out,wp(W,layer,"self_attn.o_proj.weight"),afterAttn,x],`op.${layer}`);
+      launch(kOProj,[1,Math.ceil(H/16),1],[128,1,1],[fa2Out,wp(W,layer,"self_attn.o_proj.weight"),afterAttn,x],`op.${layer}`);
       pfree(fa2Out); pfree(x);
     }
     
@@ -980,14 +980,14 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
     
     // MLP — fused gate+up dual GEMM, then SwiGLU, then fused down+Cast+Add
     const gate=palloc(INTER*4); const up=palloc(INTER*4); // f32 — dual GEMM (gate+up)
-    launch(kGPUP,[1,Math.ceil(INTER/64),1],[128,1,1],[normed2,wp(W,layer,"mlp.gate_proj.weight"),gate,wp(W,layer,"mlp.up_proj.weight"),up],`gpup.${layer}`);
+    launch(kGPUP,[1,Math.ceil(INTER/16),1],[128,1,1],[normed2,wp(W,layer,"mlp.gate_proj.weight"),gate,wp(W,layer,"mlp.up_proj.weight"),up],`gpup.${layer}`);
     pfree(normed2);
     const act=palloc(INTER*2);
     launch(kSg,[BLK1(INTER),1,1],[128,1,1],[gate,up,act],`sg.${layer}`);
     pfree(gate); pfree(up);
     // Fused down_proj+Cast+Add: output = bf16(act @ W + afterAttn)
     x=palloc(H*2); // bf16 output with residual
-    launch(kDP,[1,Math.ceil(H/64),1],[128,1,1],[act,wp(W,layer,"mlp.down_proj.weight"),x,afterAttn],`dp.${layer}`);
+    launch(kDP,[1,Math.ceil(H/16),1],[128,1,1],[act,wp(W,layer,"mlp.down_proj.weight"),x,afterAttn],`dp.${layer}`);
     pfree(afterAttn); pfree(act);
   }
   
@@ -998,7 +998,8 @@ for (let step = 0; step < tokenIds.length + genLen; step++) {
   launch(kLM,[1,Math.ceil(VOCAB/64),1],[128,1,1],[fn,embedW,logits],`lmHead`);
 
   // GPU argmax — no 1MB download, just 4 bytes (blocking cuDtoH later syncs)
-  launch(kArgmax,[1,1,1],[128,1,1],[logits,argmaxVal,argmaxIdx],`argmax`);
+  launch(kArgmax,[ARGMAX_SPLIT,1,1],[128,1,1],[logits,argmaxPV,argmaxPI],`argmax`);
+  launch(kArgmaxC,[1,1,1],[128,1,1],[argmaxPV,argmaxPI,argmaxVal,argmaxIdx],`argmaxC`);
   pfree(x); pfree(fn); pfree(logits);
   const idxBuf=new Int32Array(1);
   cuDtoH(idxBuf.buffer,argmaxIdx,BigInt(4));
@@ -1022,6 +1023,7 @@ const dt=(performance.now()-fStart)/1000;
 console.log(`\nGenerated ${genLen} tokens in ${dt.toFixed(1)}s (${(genLen/dt).toFixed(1)} tok/s)`);
 console.log(`Pool: ${_allocCount} allocs, ${_poolHits} pool hits (hit rate: ${(_poolHits/(_allocCount+_poolHits)*100).toFixed(0)}%)`);
 if (__PROF) profReport();
+profGpuReport();
 console.log(`\n=== Generated Text ===`);
 
 // Decode tokens to text using the tokenizer (we need to reverse the tokenization)

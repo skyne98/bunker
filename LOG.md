@@ -558,3 +558,130 @@ was verified earlier when the GPU had memory.
   2. Rebuild shim in a restored triton-llvm + Triton-source env to activate
      `triton_compile_targeted` / AMDGCN.
   3. Link libdevice (or native `math.*` lowering) for sqrt/log/sin/cos/tanh.
+
+## 2025-08-22 — GPU profile: decode is GEMM-bandwidth-bound, not host-bound
+
+### Tooling
+nsys cannot attach CUDA tracing to bun (no kernel data). Added a CUDA-events
+per-kernel GPU profiler to src/ttir.ts (profGpuReset/profGpuReport, gated by
+BUNKER_GPU_PROF=1): start/end cuEvent pair around every cuLaunch on the
+default stream; report syncs + reads cuEventElapsedTime per kernel. Works
+under bun. Also added optional `label` arg to loadPTX/compileAndLoad so
+kernels can report a profile name distinct from the PTX entry name (PTX entry
+must stay "mm" — cuModuleGetFunction needs the real symbol).
+
+### Env fix found
+triton_shim.c's hardcoded TRITON_LIBDEVICE default points at a broken
+python-triton Nix path ("Failed to parse libdevice"). Worked around at runtime
+with TRITON_LIBDEVICE=/nix/store/<cuda12.9 cu_nvcc>/nvvm/libdevice/libdevice.10.bc.
+The default path should be repointed (or made to resolve the cuda store).
+
+### Findings (5 gen tokens, 6 steps, 31.7ms GPU ≈ 5.3ms/step, Match 6/6)
+- Host side: launches are 2.1µs each (8580); no explicit syncs; htod 0. The
+  per-token cuDtoH "wait" is GPU kernel time showing at the barrier, not a
+  copy cost. => host round-trip is NOT the bottleneck (~1%).
+- GPU 5.3ms/step vs ~1.7ms bandwidth-bound floor (1.6GB weight stream @
+  936GB/s) => ~3× off. Kernels are the problem.
+- GEMMs = ~80% of GPU time. Per-step: mm_down 1.08ms (54µs avg, ideal 7.8µs =
+  7× off), mm_gate 0.72ms (2.3×), mm_outp 0.49ms (7×), lm_head 0.49ms
+  (586µs avg = near-bandwidth, irreducible), mm_qkv 0.39ms (1.9×), argmax
+  0.30ms (353µs for a 1MB serial scan — pure waste), emb 0.10ms (117µs for a
+  1-row gather).
+- LM-head is already ~bandwidth (508MB/step at ~936GB/s) and cannot fuse away.
+  The 2.5-3ms of addressable waste is: M=1 GEMMs under-full so they stream
+  weights at 30-40% HBM BW, plus the argmax/embed serial-path bugs.
+
+### Next target (decided by data)
+Make the M=1 GEMMs stream at high HBM bandwidth (occupancy/block-count, 16B
+vectorized loads, split-K), and rewrite argmax as a proper parallel reduction
+(+ embed gather). Realistic ceiling: ~2-2.2ms/step (~450-500 tok/s) before the
+irreducible weight stream + lm_head floor.
+
+## 2025-08-22 — Phase 0+1: env auto-fix + argmax 90x faster (plan in progress)
+
+### Phase 0 — TRITON_LIBDEVICE auto-fix (no manual env needed)
+Root cause of the earlier libdevice parse failure: triton_shim.c's compiled-in
+default is a GC'd python-triton Nix path. Fix: src/ttir.ts now scans /nix/store
+for a cuda-nvcc libdevice.10.bc and sets it via libc setenv. KEY LESSON: bun's
+process.env is virtualized — assigning process.env.X NEVER reaches C getenv().
+Must dlopen libc and call setenv() to affect the dlopen'd shim. Also repointed
+the #define default in triton_shim.c (takes effect on next shim rebuild).
+
+### Phase 1 — argmax: single-block serial scan -> two-stage parallel reduction
+- Old: grid [1] single block, serial loop 60 chunks of 4096, 353us/step for a
+  1MB scan.
+- New: buildArgmax (grid [SPLIT=128]) — each block reduces a 2048-wide
+  power-of-two tile with -inf masked padding (pointer-tensor load + explicit
+  mask + splatted -inf `other`; NOTE this Triton requires `other` as a tensor,
+  not scalar) — then buildArgmaxComb (grid [1]) walks 128 partials sequentially
+  with strict-> winner update (keeps lowest index on ties = identical to old
+  semantics). 353us -> 5.6us + 6.8us (~90x). Match 31/31 deterministic.
+- TLDR: parallel reductions must be power-of-two tiles; tie-break must match
+  the serial baseline exactly or Match breaks.
+- embed (61us/step-launch, 0.06ms/step) deferred as immaterial.
+
+### Test suite caveat (pre-existing, NOT this work)
+7 tests (test_fused_3d, fused_ttir, graph, inline_compile, int8_tc, int8_tc2,
+q4k_pipeline) fail because src/kernel.ts shells out to /tmp/triton_wrap which
+no longer exists (/tmp temp artifact). Pre-dates this session; kernel.ts
+untouched. Legacy dsl.ts path — out of scope.
+
+### Phase 2 next
+GEMM split-K bandwidth: mm_down is still 22-25% of GPU (~1.0-1.2ms/step),
+7x off its bandwidth-ideal. Plan: grid [1, N/64, SPLIT], partial + atomic
+fadd into an f32 scratch row, small epilogue (combine+cast+add) kernel.
+
+## 2025-08-22 — Phase 2: bit-exact GEMM occupancy fix (BN=16) -> 214 tok/s (+21%)
+
+### Goal
+M=1 GEMMs stream weights at 30-40% HBM BW because grid [1, N/64, 1] gives only
+16-96 blocks on 82 SMs. Fix must be BIT-EXACT (Match 31/31 is the bar).
+
+### Attempts and rejections
+1. SPLIT-K (grid [1, N/64, SPLIT], partials to scratch, combine kernel):
+   REJECTED. The mma K-chain is acc_{k+1} = dot(A_k,B_k,acc_k) — a fused
+   accumulation. Any parallel grouping re-associates the fp adds, and computing
+   partials from zero-acc then summing is not bit-identical to the fused chain.
+   Measured: 3.3x faster (mm_down 54us -> 14+4us) BUT Match 14/31 at 30 tokens.
+   NOT acceptable. (Kept the builders out — deleted them.)
+2. numWarps=8: REJECTED — produces garbage (Match 1/31, "1.5us" kernel time is
+   fake). M=1 kernels must stay <=4 warps (tile [1,16] can't fill 8 warps).
+
+### What worked: BN=64 -> BN=16 (bit-exact)
+Same serial K-chain per output element (unchanged fp association), but 4x more
+column blocks -> better SM fill. Everything verified vs Match 31/31.
+Rolled out: mm_down, mm_gate (dual N2 via opts.BN, BN2 now honors it), mm_outp,
+mm_qkv, mm_z, mm_q, mm_kv, mm_o — all BN=16, launch grids ceil(N/16).
+mm_lm left at BN=64 (already near-bandwidth at 592us/step, irreducible).
+
+### Bug I introduced then caught (note for next time)
+A failed multi-edit left defs at BN=16 but qkv/z/outp launch grids at /64:
+those kernels computed only 25% of columns -> Match 1/31. It was NOT a BN=16
+problem. Lesson: grid.y must equal ceil(N/BN) whenever BN changes; verify with
+grep that def and launch grid agree.
+
+### Result
+174-178 tok/s -> 214-216 tok/s (+21%), Match 31/31 across 3 clean runs.
+Per-kernel: mm_down 54->36us, mm_gate 35->28us, mm_qkv 26->20us; lm_head
+592us unchanged (bandwidth-bound floor).
+
+## 2025-08-22 — Phase 2 follow-up: BN=32 A/B negative; CUDA Graphs assessment
+
+- BN=32 for mm_down/mm_gate (32/112 blocks): 203.8 tok/s vs 214-216 at BN=16
+  (Match 31/31 both). REJECTED — BN=16 is the sweet spot (16 vs 32 vs 64 tested;
+  result went 176 -> 214 -> 204 -> 176 as BN went 64 -> 16 -> 32 -> 64). Reverted
+  to BN=16; re-verified 219 tok/s, Match 31/31.
+- GEMM tile tuning is now exhausted. Remaining per-step budget (~4.6ms) is
+  dominated by: lm_head 0.59ms (BW floor), mm_down+mm_gate ~1.3ms (still 2-4x
+  off BW ideal), ~240 small kernels (rms/gdn/fa2a/cv1d/sg/rope/ab) ~0.8ms that
+  are mostly <=10us each => ~0.3-0.5ms of pure launch/tail floor (est. 5-10%
+  of step).
+- CUDA Graphs (the "free megakernel"): NOT the quick win I framed earlier.
+  Blocker: the decode step passes per-token scalar args (step/Pos, tokenId) AND
+  double-buffered state pointers (conv/kv/s-state swap every token), AND host
+  param buffers are reused - so naive stream-capture bakes stale values. The
+  correct design is cuGraphExecKernelNodeSetParams per node per token (~250
+  cheap host param updates) + 2 alternating graphs for the double-buffered
+  state phase. Estimated gain only ~5-10% (the tail is smaller than hoped).
+  Cost/risk: high for a buffer. Left as a potential future step, not worth it
+  over the 21% already banked.
