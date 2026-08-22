@@ -706,3 +706,33 @@ floor. Split to BN=8 (grid [1,4,1]); the second GEMM (N2=16 -> 2 blocks) is
 guarded inside scf.if (b.lt(pN, nb2)) so blocks 2-3 skip it. Bit-exact
 (per-element K-chain unchanged), Match 31/31 x3. 280 -> 296-300 tok/s.
 Session total: 176 -> ~300 tok/s (+70%), all bit-exact.
+
+## 2025-08-22 — CUDA Graphs: TRIED, infeasible under bun ffi (reverted)
+
+Goal: capture the 287-kernel decode step into a CUDA graph and replay per
+token (per-node setParams for scalars + double-buffered state), to remove the
+per-launch tail (~0.3-0.5ms/step, est. 5-10%). Outcome: capture works, replay
+crashes bun. REVERTED to commit 13793e4 (300 tok/s, Match 31/31). The full
+attempt is preserved at /tmp/graph_attempt.patch (233 lines).
+
+What worked:
+- Stream capture + cuGraphInstantiate + cuGraphGetNodes: 287 nodes captured
+  on a cuStreamCreate(CU_STREAM_NON_BLOCKING) stream.
+- cuGraphExecKernelNodeSetParams accepted (rc=0) AFTER keeping hGraph alive
+  (node handles belong to the graph; destroying it made SetParams rc=1).
+
+bun ffi blockers found (each cost a distinct bug):
+1. cuLaunchKernel stream arg must be typed "i64" not "ptr": bun rejects any
+   pointer-typed arg whose value is < 2^32 ("Unable to convert <n> to a
+   pointer") — stream handles are ~5e8. Zero (0n) is special-cased and works.
+2. packKernelParams must retain the value buffer (pad): the void** array's
+   entries point INTO it, and it was GC-able before the later SetParams pass.
+3. cuGraphExecKernelNodeSetParams with a CUDA_KERNEL_NODE_PARAMS struct passed
+   via ptr() SEGFAULTS bun (addr ~0x6001F1C0) on the first call. This is a
+   bun-ffi lifetime/pointer crash, not a CUDA error.
+
+Conclusion: per-node struct-param updates through bun ffi are not reliable on
+this bun (1.3.13). A host-side runner (C wrapper) could do graphs, but that's
+a shim change out of scope. Accept 300 tok/s (bit-exact); the ~5-10% launch
+tail stays. This is consistent with the megakernels research: the real fix for
+boundary cost is a persistent/device-side loop, not graph replay via ffi.
