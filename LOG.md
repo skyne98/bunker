@@ -770,3 +770,14 @@ SEARCHED move dimension in the existing fusion explorer:
   Result: explore(moves:["tile"]) DISCOVERED BN=16 x BK=256 for the layer-0
   qkv GEMM (0.025ms vs 0.028ms default) — the same optimum I had hand-picked,
   now found automatically and persisted via policy.
+
+## 2025-08-22 — whole-model tile discovery: 9 shapes in 3.7s
+
+bench/discover_model_tiles.ts: derives the distinct GEMM shapes straight from
+buildModelGraph() (no hardcoded list), measures the best (BN,BK) tile per shape
+with the compile cache + progress bar, and saves per-shape policies. Config
+latency is value-independent, so only zeroed buffers are needed - no model
+weights required. 9 distinct shapes (6144/2048/4096/512/16/248320 x1024,
+1024x2048, 3584x1024, 1024x3584) discovered in 3.7s (hard 60s budget, exit 1
+over). Per-shape optima (not one global constant): e.g. q 16x128, z 32x256,
+kv/gate/down/out_p 16x256, lm_head 32x256.
