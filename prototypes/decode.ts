@@ -92,8 +92,8 @@ function tokenize(text:string, tokPath:string):Uint32Array {
 // opts.cast: store output as bf16 instead of f32 (fuses Cast into GEMM)
 // opts.add: load residual (bf16), add to output before cast/store (fuses Cast+Add)
 // opts.N2: if set, compute a SECOND GEMM [M,N2,K] with same A but different B2, output to C2 (fuses Gate+Up, A+B)
-function buildMM(M:number,N:number,K:number,opts?:{cast?:boolean,add?:boolean,N2?:number,BN?:number}) {
-  const BM=Math.min(64,M), BN=opts?.BN??Math.min(64,N), BK=Math.min(64,K);
+function buildMM(M:number,N:number,K:number,opts?:{cast?:boolean,add?:boolean,N2?:number,BN?:number,BK?:number}) {
+  const BM=Math.min(64,M), BN=opts?.BN??Math.min(64,N), BK=opts?.BK??Math.min(64,K);
   const b=new TTIRBuilder();
   const outElem=opts?.cast?"bf16":"f32";
   const A=b.param("A",{ptr:"bf16"}),B=b.param("B",{ptr:"bf16"});
@@ -776,17 +776,17 @@ console.log("compiling kernels...");
 const mm=(M:number,N:number,K:number,opts?:any,label?:string,warps?:number)=>compileAndLoad(buildMM(M,N,K,opts),"mm",warps??4,label??"mm");
 const mmF=(M:number,N:number,K:number,opts?:any,label?:string,warps?:number)=>compileAndLoad(buildMM(M,N,K,opts),"mm",warps??4,label??"mm");
 // GDN: qkv+cast, z+cast, a+b dual-GEMM, out_proj+cast+add, down_proj+cast+add
-const kQKV=mmF(1,QKVD,H,{cast:true,BN:16},"mm_qkv");           // GEMM+Cast, BN=16 => 384 blocks
-const kZ=mmF(1,ZD,H,{cast:true,BN:16},"mm_z");              // GEMM+Cast, BN=16 => 128 blocks
+const kQKV=mmF(1,QKVD,H,{cast:true,BN:16,BK:256},"mm_qkv");           // GEMM+Cast, BN=16 => 384 blocks
+const kZ=mmF(1,ZD,H,{cast:true,BN:16,BK:256},"mm_z");              // GEMM+Cast, BN=16 => 128 blocks
 const kAB=mmF(1,LVH*2,H,{N2:LVH},"mm_ab");                  // Dual GEMM (a+b) — shares input
-const kOutProj=mmF(1,H,ZD,{cast:true,add:true,BN:16},"mm_outp");  // GEMM+Cast+Add (residual), BN=16
+const kOutProj=mmF(1,H,ZD,{cast:true,add:true,BN:16,BK:256},"mm_outp");  // GEMM+Cast+Add (residual), BN=16
 // FA2: q+cast, k+cast, v+cast, o+cast+add
-const kQProj=mmF(1,QGATE,H,{cast:true,BN:16},"mm_q");       // GEMM+Cast, BN=16 => 256 blocks
-const kKVProj=mmF(1,KV_DIM,H,{cast:true,BN:16},"mm_kv");   // GEMM+Cast, BN=16 => 32 blocks
-const kOProj=mmF(1,H,NH*HD,{cast:true,add:true,BN:16},"mm_o");  // GEMM+Cast+Add, BN=16
+const kQProj=mmF(1,QGATE,H,{cast:true,BN:16,BK:256},"mm_q");       // GEMM+Cast, BN=16 => 256 blocks
+const kKVProj=mmF(1,KV_DIM,H,{cast:true,BN:16,BK:256},"mm_kv");   // GEMM+Cast, BN=16 => 32 blocks
+const kOProj=mmF(1,H,NH*HD,{cast:true,add:true,BN:16,BK:256},"mm_o");  // GEMM+Cast+Add, BN=16
 // MLP: gate+up dual-GEMM, down+cast+add
-const kGPUP=mmF(1,INTER,H,{N2:INTER,BN:16},"mm_gate");     // Dual GEMM (gate+up), BN=16 => 224 blocks
-const kDP=mmF(1,H,INTER,{cast:true,add:true,BN:16},"mm_down"); // BN=16 => 64 col blocks (bit-exact BW fix)
+const kGPUP=mmF(1,INTER,H,{N2:INTER,BN:16,BK:256},"mm_gate");     // Dual GEMM (gate+up), BN=16 => 224 blocks
+const kDP=mmF(1,H,INTER,{cast:true,add:true,BN:16,BK:256},"mm_down"); // BK=256 probe (bit-exact BW)
 // lm_head (no fusion — argmax reads f32)
 const kLM=mm(1,VOCAB,H,"mm_lm");
 // Fused Cast+Add (for cases where GEMM isn't the producer)

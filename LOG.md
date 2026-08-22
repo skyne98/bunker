@@ -685,3 +685,16 @@ Per-kernel: mm_down 54->36us, mm_gate 35->28us, mm_qkv 26->20us; lm_head
   state phase. Estimated gain only ~5-10% (the tail is smaller than hoped).
   Cost/risk: high for a buffer. Left as a potential future step, not worth it
   over the 21% already banked.
+
+## 2025-08-22 — BK 64->256 (bit-exact): 219 -> 280 tok/s (+28%)
+
+Raised tt.dot K-tile from 64 to 256 on all 8 non-lm GEMMs (down, gate dual,
+outp, qkv, z, q, kv, o). Bigger dot chunks = same ascending mma.sync k16 chain
+(identical arithmetic - verified Match 31/31 x3) but fewer loop iterations and
+far more data in flight per block. 219 -> 276-281 tok/s.
+New per-step budget (~3.5ms): lm_head ~0.7ms (at BW), mm_gate 0.38, mm_down
+0.34, mm_ab 0.37 (LAUNCH FLOOR - grid [1,1,1] tiny gemm!), mm_qkv 0.30, small
+kernels (rms/gdn/fa2a/cv1d/sg/rope) ~0.5ms, mm_outp 0.20, others ~0.4.
+Remaining path to floor (~2.0ms / 500 tok/s): (1) mm_ab + small-kernel launch
+tail, (2) GEMMs still ~1.5-2x off BW-ideal, (3) CUDA Graphs for the ~0.5ms
+tail. lm_head/footprint: token rate now 176 -> 280 = +59% over session start.
